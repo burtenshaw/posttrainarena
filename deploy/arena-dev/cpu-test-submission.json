@@ -1,0 +1,11 @@
+{
+  "submission_id": "cpu-test-replace-with-unique-id",
+  "name": "CPU test: synthetic Trackio metrics",
+  "image": "ghcr.io/openenvarena/cpu-test:synthetic",
+  "schema": {
+    "action": {"type": "object", "properties": {"action": {"type": "string"}}},
+    "observation": {"type": "object", "properties": {"observation": {"type": "string"}}}
+  },
+  "tasks": [{"task_id": "cpu-test", "split": "train"}],
+  "example_actions": [{"action": "synthetic"}]
+}

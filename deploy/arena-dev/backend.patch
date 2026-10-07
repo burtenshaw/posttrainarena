@@ -1,0 +1,1436 @@
+diff --git a/deploy/cpu-test-submission.json b/deploy/cpu-test-submission.json
+new file mode 100644
+--- /dev/null
++++ b/deploy/cpu-test-submission.json
+@@ -0,0 +1,11 @@
++{
++  "submission_id": "cpu-test-replace-with-unique-id",
++  "name": "CPU test: synthetic Trackio metrics",
++  "image": "ghcr.io/openenvarena/cpu-test:synthetic",
++  "schema": {
++    "action": {"type": "object", "properties": {"action": {"type": "string"}}},
++    "observation": {"type": "object", "properties": {"observation": {"type": "string"}}}
++  },
++  "tasks": [{"task_id": "cpu-test", "split": "train"}],
++  "example_actions": [{"action": "synthetic"}]
++}
+diff --git a/docs/trackio.md b/docs/trackio.md
+new file mode 100644
+--- /dev/null
++++ b/docs/trackio.md
+@@ -0,0 +1,120 @@
++# Trackio backend integration
++
++This directory contains the deployed `posttrain_infra` source with the Trackio integration changes. It is a source
++snapshot, not the authoritative Git repository. Run its CPU-only checks with:
++
++```sh
++PYTHONPATH=src python3 -m unittest discover -s tests -v
++```
++
++Controller configuration:
++
++```json
++{
++  "trackio": {
++    "url": "https://openenvarena-training.hf.space",
++    "token_file": "/absolute/operator/path/trackio-ingest-token"
++  },
++  "submission_quota_exempt_subjects": ["space:burtenshaw"]
++}
++```
++
++Use the deployed dashboard's actual HTTPS address. The token file contains its dedicated `TRACKIO_INGEST_TOKEN`,
++not an HF access token. The controller stages only this ingestion token in a mode-0600 file for each GPU job.
++The dashboard uses an HF storage bucket mounted by the Space and needs no application HF token; participants supply
++no credentials. Existing HF tokens are rejected
++before staging or sending metrics. A missing or invalid ingestion token disables metrics for that job and training
++continues. Configure the same dedicated secret on the dashboard and controller.
++
++Authenticated `space:burtenshaw` submissions share project `burtenshaw`. Each training run uses its complete Arena
++run ID for the Trackio run name and run ID. Dashboard identity is stored in the existing durable run record so links
++survive staging cleanup. Other principal namespaces use a stable hashed project identifier.
++
++The optional legacy `trackio.project` setting remains accepted for historical links; new runs ignore it. Existing runs
++without a stored identity retain their old links, using staged settings when present and the legacy naming convention
++otherwise. If such a run is resumed after this change, subsequent metrics use the new per-user identity; pre-migration
++curves remain in the original project and are not copied. Let active legacy jobs finish before replacing their dashboard
++write API or credentials.
++
++`submission_quota_exempt_subjects` defaults to an empty list and matches the full authenticated subject exactly. It only
++exempts submission quota checks: `space:burtenshaw` remains a participant, including automatic run creation and all
++existing ownership and permission checks.
++
++GPU jobs POST batches to `/ingest` with the dedicated bearer credential in the Authorization header and no credential
++in the JSON body. Every event includes `project`, `run`, `run_id`, `step`, `log_id`, finite numeric `metrics`, and the run's
++safe `config`. Transport retries preserve the event ID so the append-only endpoint can deduplicate them. Separate
++callbacks at the same optimizer step receive separate event IDs.
++
++The sender forwards TRL's native metric names, including loss, reward statistics, gradient norm, and completion
++lengths. `step/wall_seconds` measures from `on_step_begin` through `on_log`, including rollout failures, retries, and
++optimizer work. `step/collection_seconds` remains the successful rollout collection duration, and `step/retries`
++records failed rollout groups before that successful collection. Sending happens in a bounded background queue and
++never blocks the optimizer.
++
++## Parallel development deployment
++
++The sanitized configuration examples in `deploy/` use their own controller on port 8081, sandbox gateway on 8001,
++bridge route `/api/openenv/bridge-dev`, artifacts, transfer files, staging files, and credentials under `/data/arena-dev`.
++Create both SQLite databases under the local filesystem `/tmp/arena-dev/sql` and back them up to the dev directory.
++The server's `/home` is NFS and `/data` is shared storage; neither is the intended live SQLite filesystem.
++
++The examples default `submissions_enabled` to false. This leaves reads and the bridge available while returning a
++retryable 503 before any submission registry call, quota reservation, persistence, admission, or training enqueue.
++`GET /health` reports both process liveness and `submissions_enabled`. Existing work is not paused by this flag; start
++the dev deployment with its own empty database. Enable real training submissions only after its restricted HF execution token,
++sandbox gateway, and approved GPU allocation are ready.
++
++Gateway `deployment: "dev"` gives its Jobs the role `native-openenv-dev`. Creation, recovery of uncertain creates, and
++namespace sweeps use that role. Sweeps also verify the returned role before cancellation. Omitting deployment keeps
++the production role `native-openenv`; dev and production require separate ledgers and management secrets. The gateway
++still requires its dedicated jobs credential through `HF_API_KEY` and does not accept saved logins implicitly.
++
++Copy only `src/`, `public/`, and `pyproject.toml` from the verified server source snapshot into the independent source
++directory, then apply the reviewed patch. The public files and project metadata are required for SDK export. Run CPU
++services with `/data/arena/venvs/qualification/bin/python` and the dev `PYTHONPATH`. The provided `trainer-python`
++wrapper must be executable and selected as `slurm.python`: Slurm submits with `--export=NONE`, so simply setting
++`PYTHONPATH` on the controller does not select the dev source for GPU training. Both training dependencies and the
++pinned model cache are shared read-only; no shared package installation is needed.
++
++Generate fresh bridge, delegate, management, admin, and ingestion secrets. Populate `client_tokens` with the SHA-256
++digest of the new delegate token and principal `{"subject": "space", "roles": ["delegate"]}`; the example deliberately
++contains no token hashes. Keep secrets and their directory owner-readable only. The public dashboard ingestion token
++must match its append-only endpoint, and the Space's dev bridge secret must match this backend's bridge key.
++
++The host uses supervisord rather than systemd. Its existing read-only supervisor executable is
++`/data/arena/venvs/ops/bin/supervisord`; launch it with a separate dev configuration, PID file, socket, and logs.
++On 2026-10-07, all GPU workers were in reservation `arena` for user `carrie`, and a no-allocation `sbatch --test-only`
++check rejected an allocation for `ben`. Do not override that reservation or enable training until an approved
++allocation is available. No development process or GPU job was started while preparing these examples.
++
++For a CPU-only end-to-end test, set the controller to:
++
++```json
++{
++  "deployment": "dev",
++  "dev_cpu_dummy": {"steps": 8, "step_seconds": 1.0},
++  "submissions_enabled": true
++}
++```
++
++This explicit development mode accepts the normal authenticated submission form and keeps ownership, quotas,
++idempotency, and repeated-submission exemptions. It validates the form locally, creates a simulated submission and
++run, and sends synthetic metrics to Trackio from a CPU thread. It never pulls an image, resolves a dataset, executes
++submitted code, creates a Sandbox, schedules a Slurm job, loads a model, or writes a training checkpoint. The report
++is marked `level: "cpu-dummy"` and `admissible: false`; submission and run responses both carry `simulated: true`.
++Trackio config uses `recipe: "cpu-dummy-simulation"`, and each metric row includes `simulation: 1`.
++
++Use `deploy/cpu-test-submission.json` with a new `submission_id` for each independent test; its image reference is
++synthetic and is never fetched in this mode. The existing controller reconciliation loop drives queued simulations to
++completion. Cancellation remains terminal, and a controller restart continues from the last stored CPU step using
++that run's original settings. Keep the sandbox gateway disabled for this mode: no HF Jobs execution token or GPU
++reservation is required.
++
++The synthetic metrics generator also runs directly with only the standard library:
++
++```sh
++PYTHONPATH=src python3 -m posttrain_infra.cpu_dummy --settings /absolute/path/trackio.json --steps 8 --step-seconds 1
++```
++
++The settings file uses the same `url`, `project`, full run `name`, and dedicated ingestion `token_file` fields as a staged
++training job. This direct script demonstrates ingestion; UI submissions use the durable lifecycle described above.
+diff --git a/src/posttrain_infra/controller.py b/src/posttrain_infra/controller.py
+--- a/src/posttrain_infra/controller.py
++++ b/src/posttrain_infra/controller.py
+@@ -21,6 +21,8 @@
+ from .artifacts import artifact_store, digest_file, validate_manifest
+ from .contracts import (MAX_IMAGES, POLICY_VERSION, RESUBMIT, RUN_WALL_S, SUPPORTED_MODEL, RunConfig, Submission,
+                         TaskContract)
++from .cpu_dummy import prepare_form as prepare_dummy_form, settings as dummy_settings, simulate
++from .dashboard import Dashboard, read_ingestion_token, valid_url
+ from .lifecycle import GROUP_SETTLE_S, InfrastructureFailure
+ from .limits import environment_limits
+ from .runtime import TransportError
+@@ -59,11 +61,17 @@
+         if "oci_gateway" in config:
+             raise ValueError("oci_gateway is retired: Sandboxes pull pinned images from Docker Hub or GHCR themselves; "
+                              "remove it (deploy/README.md, Migrating)")
++        self.dev_cpu_dummy = dummy_settings(config)
+         for run in state.active_runs():
++            if (run.get("simulated") is True or run["node"] == "cpu-dummy") != (self.dev_cpu_dummy is not None):
++                raise ValueError("CPU dummy mode requires separate state from active real training runs")
+             if "images" not in state.submission(run["spec"]["submission_id"])["spec"]:
+                 raise ValueError("Finish or cancel the active runs of submissions made before image references, "
+                                  "then start this controller")
+         self.state, self.config = state, config
++        self.submissions_enabled = config.get("submissions_enabled", True)
++        if type(self.submissions_enabled) is not bool:
++            raise ValueError("submissions_enabled must be a boolean")
+         self.slurm = SlurmAdapter(config["slurm"])
+         self.lock = threading.RLock()
+         self.admission_concurrency = config.get("admission_concurrency", 1)
+@@ -98,6 +106,12 @@
+                 or type(self.submission_quota["window_s"]) not in (int, float)
+                 or not 60 <= self.submission_quota["window_s"] <= 30 * 86400):
+             raise ValueError("submission_quota must be null or {limit: 1..1000, window_s: 60..2592000}")
++        # Exact authenticated subjects may test repeatedly without receiving any operator permissions.
++        exempt = config.get("submission_quota_exempt_subjects", [])
++        if (type(exempt) is not list or any(type(subject) is not str or not subject
++                or len(subject) > 256 or any(ord(char) < 32 for char in subject) for subject in exempt)):
++            raise ValueError("submission_quota_exempt_subjects must list authenticated subjects")
++        self.submission_quota_exempt_subjects = set(exempt)
+         # Operators (the administrator token and admin principals) are not limited and start runs themselves.
+         # Every other owner is a participant: configured tokens, and the users a delegate vouches for.
+         tokens = config.get("client_tokens", {})
+@@ -115,15 +129,15 @@
+                        for model in config.get("approved_models", [])):
+                 raise ValueError("submission_run must use an approved model and tokenizer revision")
+         # The public training dashboard (Trackio on a Space): every run streams its per-step numbers there. Unset: no run
+-        # logs anywhere. token_file holds a Hugging Face token that can write to the dashboard Space and nothing else.
++        # logs anywhere. token_file holds only the dashboard's dedicated append-only ingestion token.
+         self.dashboard = config.get("trackio")
+         if self.dashboard is not None and (
+-                type(self.dashboard) is not dict or set(self.dashboard) != {"url", "project", "token_file"}
+-                or type(self.dashboard["url"]) is not str or urlsplit(self.dashboard["url"]).scheme != "https"
+-                or type(self.dashboard["project"]) is not str
+-                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", self.dashboard["project"])
+-                or type(self.dashboard["token_file"]) is not str or not self.dashboard["token_file"].startswith("/")):
+-            raise ValueError("trackio must be {url: https://..., project, token_file: an absolute path}")
++                type(self.dashboard) is not dict or set(self.dashboard) - {"url", "project", "token_file"}
++                or not valid_url(self.dashboard.get("url"))
++                or ("project" in self.dashboard and (type(self.dashboard["project"]) is not str
++                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", self.dashboard["project"])))
++                or type(self.dashboard.get("token_file")) is not str or not self.dashboard["token_file"].startswith("/")):
++            raise ValueError("trackio requires url: https://... and token_file: an absolute path; project is legacy-only")
+         # Runs in progress at once, Arena's share of GPUs: a run is started only when it would not wait for one.
+         self.max_concurrent_runs = config.get("max_concurrent_runs", config.get("slurm", {}).get("max_gpus", 8))
+         if type(self.max_concurrent_runs) is not int or not 1 <= self.max_concurrent_runs <= 1024:
+@@ -298,6 +312,11 @@
+ 
+     # ------------------------------------------------------------------ submissions
+     def submit(self, value: dict, owner: str = "local") -> dict:
++        if not self.submissions_enabled:
++            error = errors.ArenaInfrastructureError(errors.CAPACITY_BUSY,
++                "New submissions are temporarily unavailable: this deployment is not ready for training", 503)
++            error.retry_after_s = 60
++            raise error
+         if type(value) is not dict:
+             raise ValueError("A submission names its image on Docker Hub or GHCR")
+         from .submission import prepare_submission
+@@ -317,13 +336,35 @@
+                                         "Submission ID already names different immutable content", 409)
+             # The same request is the same submission: its tag was resolved once and is not read again.
+             return self.public_submission(existing)
+-        quota = self.submission_quota if owner not in self.operators else None
++        quota = self._owner_submission_quota(owner)
+         if quota is not None:
+             # Refuse before any network call; the reservation itself is atomic with the store below.
+             block = self.state.slot_block(owner, quota["limit"])
+             if block is not None:
+                 raise self._quota_error(block)
+         self._precheck_tasks(value)
++        if self.dev_cpu_dummy is not None:
++            spec = prepare_dummy_form(value, request_digest)
++            report = {"passed": True, "admissible": False, "level": "cpu-dummy", "queued_at": time.time(),
++                      "errors": [], "error_details": [], "checks": [{"name": "cpu_dummy_no_admission", "status": "skip"}]}
++            with self.lock:
++                try:
++                    current = self.state.submission(spec["submission_id"])
++                except KeyError:
++                    current = None
++                if current is not None:
++                    if current["owner"] != owner:
++                        raise PermissionError("Submission belongs to another principal")
++                    if current["spec"].get("request_digest") != request_digest:
++                        raise errors.ArenaError(errors.SUBMISSION_CONFLICT, "Submission ID names different content", 409)
++                    return self.public_submission(current)
++                try:
++                    saved = self.state.save_submission(spec, report, "validated", owner,
++                        slot=(quota["limit"], quota["window_s"]) if quota is not None else None,
++                        settle="used", queue_run=True)
++                except SlotTaken as taken:
++                    raise self._quota_error(taken.block) from None
++            return self.public_submission(saved)
+         # Every image is read anonymously from its registry and pinned by digest. A failure
+         # returns immediately: nothing is stored and no Sandbox is allocated.
+         value, evidence = prepare_submission(value, limits=self.limits, slots=self.registry_slots)
+@@ -374,12 +415,13 @@
+             try:
+                 current = self.state.run(run["run_id"])
+                 run = {**run, "state": current["state"], "policy_version": current["policy_version"],
+-                       "error_code": current.get("error_code")}
++                       "error_code": current.get("error_code"), "simulated": current.get("simulated", False)}
+             except KeyError:
+                 pass
+             if self.dashboard is not None:
+                 run = {**run, "dashboard": self.dashboard_link(record["owner"], view["submission_id"], run["run_id"])}
+         return {"submission_id": view["submission_id"], "name": errors.sanitize(record["spec"].get("name", ""), 256),
++                "simulated": view.get("simulated", False),
+                 "state": view["state"], "error_code": view["error_code"], "error_origin": view["error_origin"],
+                 "queued_at": view["admission"]["queued_at"], "slot": view.get("slot"),
+                 "images": [{key: image.get(key) for key in ("submitted", "resolved", "compatibility")}
+@@ -387,7 +429,7 @@
+                 "errors": view["report"]["errors"][:3], "run": run}
+ 
+     def _dashboard_name(self, owner: str, submission_id: str, run_id: str) -> str:
+-        """A run's name on the public dashboard: its participant's Hugging Face name and the submission.
++        """Legacy run name, kept so old submissions still point to their existing curves.
+ 
+         The run Arena started for the submission has exactly that name. Any other run of the same submission (an
+         operator's run, a re-run) also carries the start of its run ID, so two runs never share a name.
+@@ -399,12 +441,50 @@
+             started = None
+         return f"{who}/{submission_id}" if started == run_id else f"{who}/{submission_id}/{run_id[:6]}"
+ 
++    @staticmethod
++    def _dashboard_project(owner: str) -> str:
++        """The verified HF username; other principal namespaces get a stable separate identifier."""
++        if owner.startswith("space:") and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", owner[6:]):
++            return owner[6:]
++        return "principal-" + hashlib.sha256(owner.encode()).hexdigest()
++
++    def _new_dashboard_identity(self, owner: str, run_id: str) -> dict:
++        return {"url": self.dashboard["url"], "project": self._dashboard_project(owner), "name": run_id}
++
+     def dashboard_link(self, owner: str, submission_id: str, run_id: str) -> str | None:
+         """Where a run's training curves stream live, or None without a dashboard."""
+         if self.dashboard is None:
+             return None
+-        return (self.dashboard["url"].rstrip("/") + "/?" + urlencode(
+-            {"project": self.dashboard["project"], "runs": self._dashboard_name(owner, submission_id, run_id)}))
++        try:
++            record = self.state.run(run_id)
++        except KeyError:
++            record = {}
++        identity = record.get("trackio")
++        if identity is None:
++            # Older jobs wrote their identity only to the staging directory, which cleanup eventually removes.
++            shared = self.config.get("slurm", {}).get("shared_directory")
++            if shared:
++                parent = Path(shared) / "runs" / run_id
++                stages = [path for path in parent.glob("attempt-*/trackio.json")
++                          if re.fullmatch(r"attempt-[0-9]+", path.parent.name)]
++                for path in sorted(stages, key=lambda item: int(item.parent.name[8:]), reverse=True):
++                    try:
++                        staged = json.loads(path.read_text())
++                        if (type(staged) is dict and valid_url(staged.get("url"))
++                                and all(type(staged.get(key)) is str and staged[key] for key in ("project", "name"))):
++                            identity = {key: staged[key] for key in ("url", "project", "name")}
++                            break
++                    except (OSError, ValueError):
++                        pass
++        if identity is None:
++            identity = {"url": self.dashboard["url"], "project": self.dashboard.get("project", "arena"),
++                        "name": self._dashboard_name(owner, submission_id, run_id)}
++        return identity["url"].rstrip("/") + "/?" + urlencode(
++            {"project": identity["project"], "runs": identity["name"]})
++
++    def _owner_submission_quota(self, owner: str) -> dict | None:
++        return (None if owner in self.operators or owner in self.submission_quota_exempt_subjects
++                else self.submission_quota)
+ 
+     def list_submissions(self, owner: str) -> list[dict]:
+         """The owner's own submissions, newest first: what a participant's My submissions shows."""
+@@ -466,6 +546,7 @@
+         details = report.get("error_details", []) if type(report.get("error_details")) is list else []
+         view = {
+             "submission_id": record["spec"]["submission_id"], "owner": record["owner"], "state": record["state"],
++            "simulated": record["spec"].get("simulated", False),
+             "error_code": details[0].get("code") if details and record["state"] == "rejected" else None,
+             # "author": a completed check failed on the artifact. "platform": Arena or Hugging Face failed.
+             "error_origin": report.get("error_origin") if record["state"] == "rejected" else None,
+@@ -485,7 +566,8 @@
+         run = record.get("run")
+         if run is not None:
+             # Arena starts this submission's run itself; run_id stays null while it waits for capacity.
+-            view["run"] = {"run_id": run["run_id"], "queued_at": run["queued_at"], "error": run["error"]}
++            view["run"] = {"run_id": run["run_id"], "queued_at": run["queued_at"], "error": run["error"],
++                           "simulated": view["simulated"]}
+         slot = record.get("slot")
+         if slot is not None:
+             # held: being checked. used: counts until window_ends_at. returned: does not count.
+@@ -517,7 +599,7 @@
+         if spec.get("dataset") is not None:
+             repo, revision = spec["dataset"]["repo"], spec["dataset"]["revision"]
+             view["dataset"] = {"repo": repo, "revision": revision,
+-                               "url": f"https://huggingface.co/datasets/{repo}/tree/{revision}"}
++                               "url": f"https://huggingface.co/datasets/{repo}" + (f"/tree/{revision}" if revision else "")}
+         sizes = next((check for check in checks if check.get("name") == "image_sizes"), None)
+         if sizes is not None:
+             view["environment_size"] = {"measurement": "compressed_bytes_declared_by_registry_manifests",
+@@ -552,7 +634,7 @@
+ 
+     # ------------------------------------------------------------------ runs
+     def create_run(self, value: dict, owner: str = "local") -> dict:
+-        if self.submission_run is not None and owner not in self.operators:
++        if self.dev_cpu_dummy is not None or (self.submission_run is not None and owner not in self.operators):
+             raise errors.ArenaError(errors.RUN_STARTED_BY_ARENA,
+                 "Arena starts the one run of each admitted submission itself; follow it from the submission's status", 403)
+         return self._create_run(value, owner)
+@@ -742,19 +824,22 @@
+             if self.model_cache.get("offline", True):
+                 exports["HF_HUB_OFFLINE"] = "1"
+         if self.dashboard is not None:
++            # A legacy job resumed after migration starts logging under the new per-user identity.
++            # Its pre-migration curves remain at the original dashboard URL.
++            identity = record.get("trackio") or self._new_dashboard_identity(record["owner"], record["run_id"])
++            if record.get("trackio") is None:
++                self.state.update(record["run_id"], lambda current: current.update(trackio=identity), event="trackio")
+             try:
+-                dashboard_token = Path(self.dashboard["token_file"]).read_text().strip()
+-            except OSError as error:
++                dashboard_token = read_ingestion_token(self.dashboard["token_file"])
++            except (OSError, ValueError) as error:
+                 # The run trains without the dashboard rather than not at all.
+-                LOG.warning("dashboard_token_unreadable run=%s error=%s", record["run_id"], errors.sanitize(error, 200))
++                LOG.warning("dashboard_token_unreadable run=%s error=%s", record["run_id"], type(error).__name__)
+             else:
+                 write("trackio-token", dashboard_token)
+                 write("trackio.json", json.dumps({
+-                    "url": self.dashboard["url"], "project": self.dashboard["project"],
+-                    "name": self._dashboard_name(record["owner"], submission.submission_id, record["run_id"]),
++                    **identity,
+                     "token_file": str(stage / "trackio-token"),
+-                    "config": {"participant": self._dashboard_name(record["owner"], submission.submission_id,
+-                                                                   record["run_id"]).split("/")[0],
++                    "config": {"participant": identity["project"],
+                                "submission_id": submission.submission_id, "run_id": record["run_id"]}}, sort_keys=True))
+                 exports["POSTTRAIN_TRACKIO"] = str(stage / "trackio.json")
+                 exports["TRACKIO_DIR"] = str(stage / "spool" / "trackio")
+@@ -872,6 +957,7 @@
+                     "cleanup_stalled", "cleanup_error", "cleanup_pending_sessions", "operator_release", "last_group_error"):
+             result[key] = record.get(key)
+         result["group_retries"] = record.get("group_retries", 0)
++        result["simulated"] = record.get("simulated", False)
+         return result
+ 
+     def run_events(self, identifier: str, limit: int = 200) -> list[dict]:
+@@ -1116,7 +1202,10 @@
+         def change(record):
+             # A run already terminating keeps its first terminal decision.
+             if record["state"] not in ("completed", "cancelled", "failed") + TERMINATING:
+-                _begin_cleanup(record, "cancelled", None, errors.CANCELLED, now)
++                if record.get("simulated") or record["node"] == "cpu-dummy":
++                    record.update(state="cancelled", terminal_state="cancelled", error_code=errors.CANCELLED)
++                else:
++                    _begin_cleanup(record, "cancelled", None, errors.CANCELLED, now)
+         return self.public_run(self.state.update(identifier, change, event="cancel"))
+ 
+     def release(self, identifier: str, *, reason: str, remote_terminal_confirmed: bool, operator: str) -> dict:
+@@ -1157,6 +1246,9 @@
+ 
+     # ------------------------------------------------------------------ reconciliation
+     def reconcile(self):
++        if self.dev_cpu_dummy is not None:
++            self._reconcile_cpu_dummy()
++            return
+         self._reconcile_admissions()
+         with self.lock:
+             self._expire_queued_submissions()
+@@ -1186,6 +1278,77 @@
+                     self._reconcile_slurm_run(self.state.run(record["run_id"]))
+                 except Exception as error:
+                     self._cleanup_failure(record["run_id"], error)
++
++    def _reconcile_cpu_dummy(self) -> None:
++        with self.lock:
++            if self.run_start is not None and not self.run_start.done():
++                return
++            # A process restart continues its CPU simulation from the last durable step.
++            active = self.state.active_runs()
++            waiting = self.state.waiting_run()
++            existing_run_id = None
++            if active:
++                record = active[0]
++                existing_run_id = record["run_id"]
++                waiting = {"submission_id": record["spec"]["submission_id"], "owner": record["owner"]}
++            if waiting is not None:
++                self.run_start = self.run_executor.submit(self._run_cpu_dummy, waiting["submission_id"], waiting["owner"],
++                                                          existing_run_id)
++
++    def _run_cpu_dummy(self, submission_id: str, owner: str, existing_run_id: str | None = None) -> None:
++        dashboard = Dashboard(None)
++        run_id = existing_run_id
++        try:
++            submitted = self.state.submission(submission_id)
++            if submitted["spec"].get("simulated") is not True or submitted["owner"] != owner:
++                raise ValueError("CPU simulation requires an owned dummy submission")
++            options = self.dev_cpu_dummy
++            request = {"submission_id": submission_id, "request_id": submission_id, "num_updates": options["steps"],
++                       "step_seconds": options["step_seconds"], "recipe": "cpu-dummy-simulation", "gpus": 0}
++            started = existing_run_id or (submitted.get("run") or {}).get("run_id")
++            record = self.state.run(started) if started else self.state.find_request(request, owner)
++            if record is None:
++                record, _ = self.state.create_run(request, "cpu-dummy", owner, budget_s=options["steps"] * 10 + 120)
++            run_id = record["run_id"]
++            if record["state"] in ("completed", "cancelled", "failed"):
++                self.state.settle_run(submission_id, run_id=run_id)
++                return
++            options = {"steps": record["spec"]["num_updates"], "step_seconds": record["spec"]["step_seconds"]}
++            identity = record.get("trackio") or (self._new_dashboard_identity(owner, run_id) if self.dashboard else None)
++            record = self.state.update(run_id, lambda current: current.update(simulated=True, state="rolling",
++                resources={"cpu_dummy": True, "gpus": 0}, trackio=identity)
++                if current["state"] in ("queued", "rolling") else None, event="cpu_dummy_started")
++            self.state.settle_run(submission_id, run_id=run_id)
++            if record["state"] != "rolling":
++                return
++            if self.dashboard:
++                dashboard = Dashboard({**self.dashboard, **identity, "config": {
++                    "participant": identity["project"], "submission_id": submission_id, "run_id": run_id}})
++            dashboard.start({"model": "cpu-dummy-no-model", "recipe": "cpu-dummy-simulation",
++                             "num_updates": options["steps"]})
++
++            def progress(step):
++                def update(current):
++                    if current["state"] == "rolling":
++                        current.update(policy_version=step, group_index=step)
++                self.state.update(run_id, update, event="cpu_dummy_step")
++
++            completed = simulate(dashboard, **options, start_step=record["policy_version"], on_step=progress,
++                                 is_cancelled=lambda: self.state.run(run_id)["state"] != "rolling")
++            dashboard.finish(timeout_s=5)
++            if completed:
++                self.state.update(run_id, lambda current: current.update(state="completed", terminal_state="completed")
++                    if current["state"] == "rolling" else None, event="cpu_dummy_completed")
++        except Exception as error:
++            message = f"CPU simulation failed ({type(error).__name__})"
++            if run_id is None:
++                self.state.settle_run(submission_id, error=message)
++            else:
++                self.state.update(run_id, lambda current: current.update(state="failed", error=message,
++                    error_code=errors.INFRASTRUCTURE_FAILURE) if current["state"] == "rolling" else None,
++                    event="cpu_dummy_failed")
++        finally:
++            dashboard.finish(timeout_s=1)
+ 
+     def _start_queued_run(self) -> None:
+         """Start the run of the queued submission that has waited longest, when capacity allows."""
+diff --git a/src/posttrain_infra/cpu_dummy.py b/src/posttrain_infra/cpu_dummy.py
+new file mode 100644
+--- /dev/null
++++ b/src/posttrain_infra/cpu_dummy.py
+@@ -0,0 +1,94 @@
++"""Explicit development-only CPU simulation for exercising submission status and Trackio.
++
++No model, submitted code, image, dataset, Sandbox, or GPU is loaded. Metrics are synthetic.
++It can also run directly: python -m posttrain_infra.cpu_dummy --settings /path/to/trackio.json.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++from pathlib import Path
++import re
++import time
++
++from .contracts import claimed_source, parse_dataset_name
++from .dashboard import Dashboard
++
++
++def settings(config: dict) -> dict | None:
++    value = config.get("dev_cpu_dummy")
++    if value is None:
++        return None
++    if config.get("deployment") != "dev" or type(value) is not dict or set(value) - {"steps", "step_seconds"}:
++        raise ValueError("dev_cpu_dummy requires deployment=dev and {steps, step_seconds}")
++    value = {"steps": 8, "step_seconds": 1.0, **value}
++    if type(value["steps"]) is not int or not 1 <= value["steps"] <= 100:
++        raise ValueError("dev_cpu_dummy.steps must be in [1, 100]")
++    if (type(value["step_seconds"]) not in (int, float) or not math.isfinite(value["step_seconds"])
++            or not 0 <= value["step_seconds"] <= 10):
++        raise ValueError("dev_cpu_dummy.step_seconds must be in [0, 10]")
++    return value
++
++
++def prepare_form(value: dict, request_digest: str) -> dict:
++    """Store the submitted form truthfully as unverified; never invent image or dataset pins."""
++    from .submission import task_images
++    references = task_images(value)
++    identifier, name = value.get("submission_id"), value.get("name")
++    if type(identifier) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", identifier):
++        raise ValueError("submission_id must be a bounded identifier")
++    if type(name) is not str or not 1 <= len(name) <= 256 or any(not char.isprintable() for char in name):
++        raise ValueError("name must contain 1 to 256 printable characters")
++    schema, actions = value.get("schema"), value.get("example_actions")
++    if type(schema) is not dict or any(type(schema.get(key)) is not dict for key in ("action", "observation")):
++        raise ValueError("A submission needs action and observation schema objects")
++    if type(actions) is not list or not actions or any(type(action) is not dict for action in actions):
++        raise ValueError("A submission needs an example_actions list")
++    spec = {"submission_id": identifier, "name": name, "request_digest": request_digest, "simulated": True,
++            "images": [{"submitted_image": reference} for reference in dict.fromkeys(references)],
++            "tasks": [{**task, "image": reference} for task, reference in zip(value["tasks"], references)]}
++    if "source" in value:
++        spec["source"] = claimed_source(value["source"])
++    if "dataset" in value:
++        spec["dataset"] = {"repo": parse_dataset_name(value["dataset"]), "revision": None}
++    return spec
++
++
++def simulate(dashboard: Dashboard, *, steps: int, step_seconds: float, start_step: int = 0,
++             on_step=None, is_cancelled=lambda: False) -> bool:
++    """Emit synthetic training-shaped metrics on the CPU; return false if cancelled."""
++    for step in range(start_step + 1, steps + 1):
++        if is_cancelled():
++            return False
++        dashboard.begin_step()
++        time.sleep(step_seconds)
++        if is_cancelled():
++            return False
++        progress = step / steps
++        dashboard.note({"step/retries": 0, "step/collection_seconds": 0, "simulation": 1})
++        dashboard.log({"loss": 1.0 / (step + 1), "reward": 0.2 + 0.7 * progress,
++                       "reward_std": 0.2 / math.sqrt(step), "grad_norm": 0.8 / math.sqrt(step),
++                       "completions/mean_length": 64 + 8 * step}, step)
++        if on_step is not None:
++            on_step(step)
++    return True
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Synthetic CPU metrics only; performs no model training")
++    parser.add_argument("--settings", required=True, help="Trackio settings with dedicated ingestion token file")
++    parser.add_argument("--steps", type=int, default=8)
++    parser.add_argument("--step-seconds", type=float, default=1)
++    args = parser.parse_args()
++    options = settings({"deployment": "dev", "dev_cpu_dummy": {"steps": args.steps, "step_seconds": args.step_seconds}})
++    dashboard = Dashboard(json.loads(Path(args.settings).read_text()))
++    dashboard.start({"model": "cpu-dummy-no-model", "recipe": "cpu-dummy-simulation", "num_updates": args.steps})
++    try:
++        simulate(dashboard, **options)
++    finally:
++        dashboard.finish()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/posttrain_infra/dashboard.py b/src/posttrain_infra/dashboard.py
+--- a/src/posttrain_infra/dashboard.py
++++ b/src/posttrain_infra/dashboard.py
+@@ -1,11 +1,10 @@
+ """The public training dashboard: each run's per-step numbers, streamed live to the arena's Trackio Space.
+ 
+-The controller gives a training job the dashboard's address, the run's name there and a Hugging Face token that can
+-write to the dashboard Space and nothing else; ``POSTTRAIN_TRACKIO`` names the file that holds them. Rows go to the
+-dashboard's ``bulk_log`` API from a background thread over plain HTTPS: a Trackio Space accepts writes only with a
+-Hugging Face token, and Trackio's own client sends one only after asking the Hub, which training jobs cannot reach
+-(they run with the Hub offline). Training never depends on the dashboard: rows wait in a bounded queue, a failed post
+-is tried twice more, and the first failure of each kind is reported once in the trainer's log.
++The controller gives a training job the dashboard's address, the run's identity and a dedicated append-only ingestion
++token; ``POSTTRAIN_TRACKIO`` names the file that holds them. The GPU never receives the dashboard's Hugging Face
++credential. Rows go to the dashboard's ``/ingest`` endpoint from a background thread over HTTPS. Training never
++depends on the dashboard: rows wait in a bounded queue, a failed post is tried twice more, and the first failure of
++each kind is reported once in the trainer's log.
+ """
+ from __future__ import annotations
+ 
+@@ -14,9 +13,12 @@
+ import os
+ from pathlib import Path
+ import queue
++import re
+ import threading
+ import time
++from urllib.parse import urlsplit
+ import urllib.request
++import uuid
+ 
+ ENVIRONMENT = "POSTTRAIN_TRACKIO"
+ POST_TIMEOUT_S = 15
+@@ -24,10 +26,35 @@
+ BATCH_ROWS = 50
+ 
+ 
++def _metric_number(value: object) -> bool:
++    # Avoid float coercion of giant Python ints, which can raise inside the optimizer's logging callback.
++    return ((type(value) is int and -(2 ** 63) <= value < 2 ** 63)
++            or (type(value) is float and math.isfinite(value)))
++
++
++def valid_url(value: object) -> bool:
++    """An HTTPS dashboard base address, without credentials or query parameters."""
++    if type(value) is not str:
++        return False
++    try:
++        parsed = urlsplit(value)
++        return (parsed.scheme == "https" and bool(parsed.hostname) and parsed.username is None
++                and parsed.password is None and not parsed.query and not parsed.fragment)
++    except ValueError:
++        return False
++
++
++def read_ingestion_token(path: str) -> str:
++    token = Path(path).read_text().strip()
++    if not token or token.startswith("hf_") or any(not 33 <= ord(char) <= 126 for char in token):
++        raise ValueError("dashboard requires a dedicated ingestion token")
++    return token
++
++
+ class Dashboard:
+     def __init__(self, settings: dict | None):
+         self.settings, self.pending, self.warned = settings, {}, set()
+-        self.token = self.config = self.sender = None
++        self.token = self.config = self.sender = self.step_started = None
+         self.rows: queue.Queue = queue.Queue(maxsize=QUEUE_ROWS)
+ 
+     @classmethod
+@@ -38,7 +65,7 @@
+             try:
+                 dashboard.settings = json.loads(Path(path).read_text())
+             except (OSError, ValueError) as error:
+-                dashboard._warn("settings", f"cannot read {path}: {error}")
++                dashboard._warn("settings", f"cannot read dashboard settings ({type(error).__name__})")
+         return dashboard
+ 
+     def _warn(self, kind: str, message: str) -> None:
+@@ -51,12 +78,17 @@
+         if not self.settings:
+             return
+         try:
+-            self.token = Path(self.settings["token_file"]).read_text().strip()
++            if type(self.settings) is not dict or not valid_url(self.settings.get("url")):
++                raise ValueError("invalid dashboard settings")
++            self.token = read_ingestion_token(self.settings["token_file"])
+             self.config = {**self.settings.get("config", {}), **config}
+-            self.endpoint = self.settings["url"].rstrip("/") + "/api/bulk_log"
++            self.endpoint = self.settings["url"].rstrip("/") + "/ingest"
+             self.project, self.name = self.settings["project"], self.settings["name"]
+-        except (OSError, KeyError, TypeError, AttributeError) as error:
+-            self._warn("start", f"{type(error).__name__}: {error}")
++            if any(type(value) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
++                   for value in (self.project, self.name)):
++                raise ValueError("invalid dashboard run identity")
++        except (OSError, KeyError, TypeError, AttributeError, ValueError) as error:
++            self._warn("start", f"cannot start dashboard sender ({type(error).__name__})")
+             return
+         self.sender = threading.Thread(target=self._send, name="training-dashboard", daemon=True)
+         self.sender.start()
+@@ -65,28 +97,35 @@
+         """Numbers about the step in progress, sent together with the trainer's own numbers for that step."""
+         self.pending.update(values)
+ 
++    def begin_step(self) -> None:
++        """Start the optimizer step's wall clock before rollout collection and its retries."""
++        self.step_started = time.monotonic()
++
+     def log(self, values: dict, step: int) -> None:
++        if self.step_started is not None:
++            self.pending["step/wall_seconds"] = time.monotonic() - self.step_started
++            self.step_started = None
+         row = {key: value for key, value in {**values, **self.pending}.items()
+-               if type(value) in (int, float) and math.isfinite(value)}
++               if _metric_number(value)}
+         self.pending.clear()
+         if self.sender is None or not row:
+             return
+-        # The log ID makes a row sent twice (a retry, a resumed run) count once.
+-        entry = {"project": self.project, "run": self.name, "run_id": None, "metrics": row, "step": step,
+-                 "log_id": f"{self.config.get('run_id', self.name)}-{step}", "config": self.config}
++        # HTTP retries reuse this ID; separate callbacks at the same step remain separate events.
++        entry = {"project": self.project, "run": self.name, "run_id": self.name, "metrics": row, "step": step,
++                 "log_id": uuid.uuid4().hex, "config": self.config}
+         try:
+             self.rows.put_nowait(entry)
+         except queue.Full:
+             self._warn("queue", "the dashboard is not keeping up, so some steps were not sent")
+ 
+     def _post(self, entries: list[dict]) -> None:
+-        body = json.dumps({"args": [], "kwargs": {"logs": entries, "hf_token": self.token}}, allow_nan=False).encode()
++        body = json.dumps({"logs": entries}, allow_nan=False).encode()
+         request = urllib.request.Request(self.endpoint, data=body, method="POST",
+-                                         headers={"Content-Type": "application/json"})
++                                         headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"})
+         with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S) as reply:
+             answer = json.loads(reply.read(1 << 20) or b"{}")
+         if type(answer) is dict and answer.get("error"):
+-            raise RuntimeError(answer["error"])
++            raise RuntimeError("dashboard rejected metrics")
+ 
+     def _send(self) -> None:
+         while True:
+@@ -109,7 +148,7 @@
+                     break
+                 except Exception as error:  # The dashboard never stops training.
+                     if attempt == 2:
+-                        self._warn("post", f"{type(error).__name__}: {str(error)[:200]}")
++                        self._warn("post", f"cannot send metrics ({type(error).__name__})")
+                     else:
+                         time.sleep(2 * (attempt + 1))
+ 
+diff --git a/src/posttrain_infra/hf_sessions.py b/src/posttrain_infra/hf_sessions.py
+--- a/src/posttrain_infra/hf_sessions.py
++++ b/src/posttrain_infra/hf_sessions.py
+@@ -13,10 +13,20 @@
+ CREATE_SETTLE_S = 30
+ 
+ 
++def deployment_role(deployment: str | None) -> str:
++    if deployment is None:
++        return "native-openenv"
++    if type(deployment) is not str or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", deployment):
++        raise ValueError("deployment must be a lowercase identifier of at most 32 characters")
++    return "native-openenv-" + deployment
++
++
+ class ManagedHFSessions:
+     def __init__(self, ledger_path: str, shared_secret: str, max_concurrent_envs: int,
+                  *, namespace: str | None = None, sandbox_connect=None,
+-                 jobs_api_factory=None, quota: HubQuota | None = None, token: str | None = None):
++                 jobs_api_factory=None, quota: HubQuota | None = None, token: str | None = None,
++                 deployment: str | None = None):
++        self.role = deployment_role(deployment)
+         if (type(shared_secret) is not str or len(shared_secret) < 32
+                 or any(char.isspace() for char in shared_secret)):
+             raise ValueError("Native gateway secret needs at least 32 characters")
+@@ -113,9 +123,11 @@
+             if time.time() - row["updated_at"] < CREATE_SETTLE_S:
+                 return
+             matches = self._bounded_api_call(lambda: list(self._api().list_jobs(
+-                namespace=namespace, labels={"posttrain-role": "native-openenv",
++                namespace=namespace, labels={"posttrain-role": self.role,
+                                              "posttrain-allocation": nonce},
+                 token=self._token, timeout=5)), 5)
++            matches = [job for job in matches if (job.labels or {}).get("posttrain-role") == self.role
++                       and (job.labels or {}).get("posttrain-allocation") == nonce]
+             if not matches:
+                 self.ledger.mark_cleaned(nonce)
+                 return
+@@ -207,17 +219,19 @@
+         return len(self._orphans)
+ 
+     def sweep(self, now: float | None = None) -> int:
+-        """Cancel every Sandbox Job in the namespace that is past the deadline written on it at creation.
++        """Cancel this deployment's Sandbox Jobs past the deadline written on them at creation.
+ 
+         Needs no ledger: the deadline is a label of the Job, set by the gateway
+         that created it. One list call; a cancel per overdue Job.
+         """
+         now = time.time() if now is None else now
+         jobs = self._bounded_api_call(lambda: list(self._api().list_jobs(
+-            namespace=self.namespace, status="RUNNING", labels={"posttrain-role": "native-openenv"},
++            namespace=self.namespace, status="RUNNING", labels={"posttrain-role": self.role},
+             token=self._token, timeout=10)), 20)
+         ended = 0
+         for job in jobs:
++            if (job.labels or {}).get("posttrain-role") != self.role:
++                continue
+             deadline = str((job.labels or {}).get("posttrain-deadline", ""))
+             if deadline.isdecimal() and int(deadline) <= now:
+                 self._bounded_api_call(lambda: self._api().cancel_job(job_id=job.id, namespace=self.namespace,
+diff --git a/src/posttrain_infra/native_gateway.py b/src/posttrain_infra/native_gateway.py
+--- a/src/posttrain_infra/native_gateway.py
++++ b/src/posttrain_infra/native_gateway.py
+@@ -33,7 +33,7 @@
+ 
+ from . import errors
+ from .contracts import parse_image_reference
+-from .hf_sessions import ManagedHFSessions
++from .hf_sessions import ManagedHFSessions, deployment_role
+ from .hf_sandbox import (EXECUTION_PERMISSIONS, SANDBOX_CONTROL_PORT, HubQuota, audit_execution_identity,
+                          exposed_origin, exposing, install_bounded_control, install_hub_quota, install_port_exposure)
+ from .runtime import MAX_RPC_BYTES, _NoRedirect, decode_json, read_bounded, websocket_connect
+@@ -179,7 +179,7 @@
+                     namespace=self.namespace, token=self.manager._token, forward_hf_token=False,
+                     idle_timeout=max(600, int(lifetime) + 60),
+                     start_timeout=self.manager.startup_wall_s,
+-                    labels={"posttrain-role": "native-openenv", "posttrain-allocation": self.nonce,
++                    labels={"posttrain-role": self.manager.role, "posttrain-allocation": self.nonce,
+                             # Written on the Job itself, so any gateway can end it after its time without a ledger.
+                             "posttrain-deadline": str(int(self.expires_at + LIFETIME_GRACE_S)),
+                             "name": "arena-native-" + self.nonce})
+@@ -299,9 +299,10 @@
+ class NativeManager(ManagedHFSessions):
+     def __init__(self, config: dict, *, sandbox_factory=None):
+         allowed = {"mode", "flavor", "namespace", "startup_wall_s", "operation_wall_s",
+-                   "episode_wall_s", "max_concurrent_envs", "management", "execution_identity"}
++                   "episode_wall_s", "max_concurrent_envs", "management", "execution_identity", "deployment"}
+         if type(config) is not dict or set(config) - allowed or config.get("mode") != "native":
+             raise ValueError("Native gateway configuration requires mode=native")
++        deployment_role(config.get("deployment"))  # Validate before credentials or Hub calls.
+         management = config.get("management")
+         if (type(management) is not dict or set(management) - {"ledger_path", "shared_secret_file", "api_budget"}
+                 or not {"ledger_path", "shared_secret_file"} <= set(management)):
+@@ -345,7 +346,8 @@
+                                    "replies are patched for that version only")
+             self.identity = self._execution_identity(token, identity)
+         super().__init__(management["ledger_path"], secret,
+-            config.get("max_concurrent_envs", 5), namespace=self.namespace, quota=quota, token=token)
++            config.get("max_concurrent_envs", 5), namespace=self.namespace, quota=quota, token=token,
++            deployment=config.get("deployment"))
+ 
+     def _execution_identity(self, token: str, settings: dict) -> dict:
+         """Refuse to run submitted images with a token that could do more than run them.
+@@ -461,6 +463,7 @@
+                 # Who starts Sandboxes and what else that token could do; never the token.
+                 "execution_identity": manager.identity,
+                 "config": {"flavor": manager.flavor, "max_concurrent_envs": manager.max_concurrent_envs,
++                           "posttrain_role": manager.role,
+                            "startup_wall_s": manager.startup_wall_s,
+                            "operation_wall_s": manager.operation_wall_s,
+                            "episode_wall_s": manager.episode_wall_s}}
+diff --git a/src/posttrain_infra/server.py b/src/posttrain_infra/server.py
+--- a/src/posttrain_infra/server.py
++++ b/src/posttrain_infra/server.py
+@@ -427,7 +427,8 @@
+         try:
+             parts = self.path_parts()
+             if parts == ["health"] and self.command == "GET":
+-                return self.reply(200, {"status": "ok"})
++                return self.reply(200, {"status": "ok", "submissions_enabled":
++                                       getattr(self.server.controller, "submissions_enabled", True)})
+             self.route = parts[0] if parts[0] in {"submissions", "runs", "internal", "messages"} else "unknown"
+             return self.internal(parts) if parts[0] == "internal" else self.public(parts)
+         except (BrokenPipeError, ConnectionResetError):
+diff --git a/src/posttrain_infra/trainer.py b/src/posttrain_infra/trainer.py
+--- a/src/posttrain_infra/trainer.py
++++ b/src/posttrain_infra/trainer.py
+@@ -352,6 +352,9 @@
+ 
+         class Stream(TrainerCallback):
+             # Every optimizer step's numbers go to the public training dashboard.
++            def on_step_begin(self, args, state, control, **kwargs):
++                dashboard.begin_step()
++
+             def on_log(self, args, state, control, logs=None, **kwargs):
+                 dashboard.log(logs or {}, state.global_step)
+ 
+diff --git a/tests/test_cpu_dummy.py b/tests/test_cpu_dummy.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_cpu_dummy.py
+@@ -0,0 +1,188 @@
++"""Real CPU dummy lifecycle with network-free metrics capture and existing API authentication."""
++import copy
++import hashlib
++import json
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++from urllib.error import HTTPError
++from urllib.parse import parse_qs, urlsplit
++from urllib.request import Request, urlopen
++
++from posttrain_infra import errors
++from posttrain_infra.controller import Controller
++from posttrain_infra.cpu_dummy import settings
++from posttrain_infra.dashboard import Dashboard
++from posttrain_infra.server import create_server
++from posttrain_infra.state import State
++
++FIXTURE = Path(__file__).resolve().parents[1] / "deploy" / "cpu-test-submission.json"
++
++
++class CPUFakeTrainingTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        self.token = self.root / "ingest-token"
++        self.token.write_text("dedicated-test-ingestion-token")
++        self.config = {"deployment": "dev", "dev_cpu_dummy": {"steps": 3, "step_seconds": 0},
++                       "slurm": {"partition": "main", "gpu_type": "nvidia_h200"},
++                       "submission_quota_exempt_subjects": ["space:burtenshaw"],
++                       "trackio": {"url": "https://metrics.hf.space", "token_file": str(self.token)},
++                       "transfer_directory": str(self.root / "transfers")}
++        self.state = State(str(self.root / "state.db"))
++        self.controller = self.new_controller()
++        self.rows = []
++        self.capture = patch.object(Dashboard, "_post", side_effect=lambda batch: self.rows.extend(copy.deepcopy(batch)))
++        self.capture.start()
++        self.addCleanup(self.capture.stop)
++        for target in ("posttrain_infra.submission.resolve_image", "posttrain_infra.submission.resolve_dataset",
++                       "posttrain_infra.controller.Controller._hf_gateway",
++                       "posttrain_infra.controller.Controller._reconcile_slurm_run",
++                       "posttrain_infra.slurm.SlurmAdapter.submit", "posttrain_infra.slurm.SlurmAdapter.probe_worker"):
++            blocked = patch(target, side_effect=AssertionError("CPU mode called external infrastructure"))
++            blocked.start()
++            self.addCleanup(blocked.stop)
++
++    def new_controller(self):
++        controller = Controller(self.state, self.config)
++        self.addCleanup(controller.validation_executor.shutdown)
++        self.addCleanup(controller.run_executor.shutdown)
++        return controller
++
++    def form(self, identifier):
++        form = json.loads(FIXTURE.read_text())
++        form["submission_id"] = identifier
++        return form
++
++    def complete(self):
++        self.controller.reconcile()
++        self.controller.run_start.result(timeout=5)
++
++    def test_multiple_submissions_emit_distinct_complete_simulations_in_user_project(self):
++        for identifier in ("cpu-first", "cpu-second"):
++            accepted = self.controller.submit(self.form(identifier), owner="space:burtenshaw")
++            self.assertTrue(accepted["simulated"])
++            self.assertTrue(accepted["run"]["simulated"])
++            self.assertFalse(accepted["report"]["admissible"])
++            self.assertIsNone(accepted["images"][0]["resolved"])
++            self.complete()
++        submissions = self.controller.list_submissions("space:burtenshaw")
++        ids = {item["run"]["run_id"] for item in submissions}
++        self.assertEqual(len(ids), 2)
++        self.assertEqual(len(self.rows), 6)
++        self.assertEqual({row["run_id"] for row in self.rows}, ids)
++        for item in submissions:
++            run = item["run"]
++            self.assertEqual(run["state"], "completed")
++            self.assertEqual(run["policy_version"], 3)
++            self.assertTrue(item["simulated"] and run["simulated"])
++            self.assertEqual(parse_qs(urlsplit(run["dashboard"]).query),
++                             {"project": ["burtenshaw"], "runs": [run["run_id"]]})
++            stored = self.state.run(run["run_id"])
++            self.assertEqual(stored["node"], "cpu-dummy")
++            self.assertEqual(stored["resources"], {"cpu_dummy": True, "gpus": 0})
++            self.assertIsNone(stored["checkpoint"])
++            self.assertNotIn("slurm_job_id", stored)
++        for row in self.rows:
++            self.assertEqual(row["project"], "burtenshaw")
++            self.assertEqual(row["run"], row["run_id"])
++            self.assertEqual(row["config"]["recipe"], "cpu-dummy-simulation")
++            self.assertEqual(row["metrics"]["simulation"], 1)
++            self.assertIn("step/wall_seconds", row["metrics"])
++
++    def test_real_quota_and_owner_checks_still_apply(self):
++        self.controller.submit(self.form("limited"), owner="space:another-user")
++        with self.assertRaises(errors.ArenaError) as raised:
++            self.controller.submit(self.form("limited-again"), owner="space:another-user")
++        self.assertEqual(raised.exception.code, errors.SUBMISSION_QUOTA_EXCEEDED)
++        with self.assertRaises(PermissionError):
++            self.controller.submit(self.form("limited"), owner="space:burtenshaw")
++        self.assertEqual(self.controller.list_submissions("space:burtenshaw"), [])
++        with self.assertRaises(errors.ArenaError):
++            self.controller.create_run({}, owner="local")
++
++    def test_idempotent_submission_and_conflicting_content(self):
++        form = self.form("repeat")
++        self.controller.submit(form, owner="space:burtenshaw")
++        self.complete()
++        first = self.state.submission("repeat")["run"]["run_id"]
++        result = self.controller.submit(form, owner="space:burtenshaw")
++        self.assertEqual(result["run"]["run_id"], first)
++        self.assertEqual(len(self.rows), 3)
++        form["name"] = "different"
++        with self.assertRaises(errors.ArenaError) as raised:
++            self.controller.submit(form, owner="space:burtenshaw")
++        self.assertEqual(raised.exception.code, errors.SUBMISSION_CONFLICT)
++
++    def test_cancellation_in_create_start_gap_cannot_be_resurrected(self):
++        self.controller.submit(self.form("cancel-start"), owner="space:burtenshaw")
++        original = self.state.update
++
++        def cancel_before_start(identifier, change, *, event=None):
++            if event == "cpu_dummy_started":
++                self.controller.cancel(identifier)
++            return original(identifier, change, event=event)
++
++        with patch.object(self.state, "update", side_effect=cancel_before_start):
++            self.complete()
++        run = self.controller.list_submissions("space:burtenshaw")[0]["run"]
++        self.assertEqual(run["state"], "cancelled")
++        self.assertEqual(run["policy_version"], 0)
++        self.assertEqual(self.rows, [])
++
++    def test_restart_continues_only_unfinished_cpu_steps(self):
++        self.controller.submit(self.form("restart"), owner="space:burtenshaw")
++        request = {"submission_id": "restart", "request_id": "restart", "num_updates": 3,
++                   "step_seconds": 0, "recipe": "cpu-dummy-simulation", "gpus": 0}
++        run, _ = self.state.create_run(request, "cpu-dummy", "space:burtenshaw")
++        # Model the crash before simulated is stamped, then after two durable steps.
++        self.state.update(run["run_id"], lambda current: current.update(policy_version=2))
++        # The run-to-submission link has not yet committed either.
++        self.config["dev_cpu_dummy"]["steps"] = 8
++        self.controller = self.new_controller()
++        self.complete()
++        self.assertEqual(self.state.run(run["run_id"])["state"], "completed")
++        self.assertEqual([row["step"] for row in self.rows], [3])
++
++    def test_mode_requires_explicit_dev_gate(self):
++        with self.assertRaises(ValueError):
++            settings({"dev_cpu_dummy": {"steps": 3}})
++        with self.assertRaises(ValueError):
++            settings({"deployment": "production", "dev_cpu_dummy": {}})
++        self.assertIsNone(settings({}))
++
++    def test_submission_http_requires_auth_and_uses_verified_delegate_subject(self):
++        delegate = "test-delegate-token"
++        self.controller.config["client_tokens"] = {
++            hashlib.sha256(delegate.encode()).hexdigest(): {"subject": "space", "roles": ["delegate"]}}
++        server = create_server(self.controller, host="127.0.0.1", port=0, api_token="test-admin-token")
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        base = f"http://127.0.0.1:{server.server_address[1]}"
++        payload = json.dumps(self.form("http-test")).encode()
++        try:
++            with self.assertRaises(HTTPError) as raised:
++                urlopen(Request(base + "/submissions", data=payload,
++                                headers={"Content-Type": "application/json"}), timeout=2)
++            with raised.exception as response:
++                self.assertEqual(response.code, 401)
++            request = Request(base + "/submissions", data=payload, headers={"Content-Type": "application/json",
++                "Authorization": "Bearer " + delegate, "X-Arena-Subject": "burtenshaw"})
++            with urlopen(request, timeout=2) as response:
++                accepted = json.load(response)
++                self.assertEqual(response.status, 202)
++                self.assertEqual(accepted["owner"], "space:burtenshaw")
++            self.complete()
++            self.assertEqual(self.rows[0]["project"], "burtenshaw")
++        finally:
++            server.shutdown()
++            server.server_close()
++            thread.join(timeout=2)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_dev_deployment.py b/tests/test_dev_deployment.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_dev_deployment.py
+@@ -0,0 +1,125 @@
++"""Readiness and sandbox isolation checks; no HF calls, GPU, or training dependencies."""
++import json
++from pathlib import Path
++import tempfile
++import threading
++from types import SimpleNamespace
++import unittest
++from unittest.mock import Mock, patch
++from urllib.request import Request, urlopen
++from urllib.error import HTTPError
++
++from posttrain_infra import errors
++from posttrain_infra.controller import Controller
++from posttrain_infra.hf_sessions import ManagedHFSessions, deployment_role
++from posttrain_infra.server import create_server
++from posttrain_infra.state import State
++
++
++class DeploymentIsolationTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.api = Mock()
++
++    def manager(self, deployment=None):
++        return ManagedHFSessions(str(Path(self.temporary.name) / "ledger.sqlite"), "a" * 32, 10,
++                                 namespace="openenvarena", jobs_api_factory=lambda: self.api, deployment=deployment)
++
++    def test_dev_sweeper_only_cancels_its_overdue_jobs_even_with_unfiltered_reply(self):
++        manager = self.manager("dev")
++        self.api.list_jobs.return_value = [
++            SimpleNamespace(id="dev-expired", labels={"posttrain-role": "native-openenv-dev", "posttrain-deadline": "10"}),
++            SimpleNamespace(id="dev-live", labels={"posttrain-role": "native-openenv-dev", "posttrain-deadline": "30"}),
++            SimpleNamespace(id="prod-expired", labels={"posttrain-role": "native-openenv", "posttrain-deadline": "10"}),
++            SimpleNamespace(id="another-dev", labels={"posttrain-role": "native-openenv-dev2", "posttrain-deadline": "10"}),
++            SimpleNamespace(id="unlabelled", labels=None),
++            SimpleNamespace(id="invalid-deadline", labels={"posttrain-role": "native-openenv-dev", "posttrain-deadline": "?"}),
++        ]
++        self.assertEqual(manager.sweep(now=20), 1)
++        self.api.list_jobs.assert_called_once_with(namespace="openenvarena", status="RUNNING",
++            labels={"posttrain-role": "native-openenv-dev"}, token=None, timeout=10)
++        self.api.cancel_job.assert_called_once_with(job_id="dev-expired", namespace="openenvarena", token=None)
++
++    def test_default_sweeper_preserves_production_role(self):
++        manager = self.manager()
++        self.api.list_jobs.return_value = [
++            SimpleNamespace(id="dev-expired", labels={"posttrain-role": "native-openenv-dev", "posttrain-deadline": "10"}),
++            SimpleNamespace(id="prod-expired", labels={"posttrain-role": "native-openenv", "posttrain-deadline": "10"}),
++        ]
++        self.assertEqual(manager.sweep(now=20), 1)
++        self.assertEqual(manager.role, "native-openenv")
++        self.api.cancel_job.assert_called_once_with(job_id="prod-expired", namespace="openenvarena", token=None)
++
++    def test_intent_recovery_filters_by_deployment_and_allocation(self):
++        manager = self.manager("dev")
++        manager.ledger = Mock()
++        manager._connect_sandbox = Mock(return_value=Mock())
++        manager._observe_terminal = Mock(return_value=True)
++        self.api.list_jobs.return_value = [
++            SimpleNamespace(id="prod", labels={"posttrain-role": "native-openenv", "posttrain-allocation": "nonce"}),
++            SimpleNamespace(id="unrelated-dev", labels={"posttrain-role": "native-openenv-dev", "posttrain-allocation": "other"}),
++            SimpleNamespace(id="dev", labels={"posttrain-role": "native-openenv-dev", "posttrain-allocation": "nonce"}),
++        ]
++        manager._recover_row({"nonce": "nonce", "sandbox_id": None, "namespace": "openenvarena",
++                              "state": "creating", "updated_at": 0})
++        manager._connect_sandbox.assert_called_once_with("dev", "openenvarena")
++        manager.ledger.record_created.assert_called_once_with("nonce", "dev")
++
++    def test_invalid_deployment_rejected_before_opening_ledger(self):
++        for value in ("", "../prod", "DEV", "a" * 33, False, 1):
++            with self.assertRaises(ValueError):
++                deployment_role(value)
++        self.assertEqual(deployment_role("dev"), "native-openenv-dev")
++
++
++class SubmissionReadinessTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        self.state = State(str(self.root / "controller.sqlite"))
++        config = {"slurm": {"partition": "main", "gpu_type": "nvidia_h200"},
++                  "submissions_enabled": False, "transfer_directory": str(self.root / "transfers")}
++        self.controller = Controller(self.state, config)
++        self.addCleanup(self.controller.validation_executor.shutdown)
++        self.addCleanup(self.controller.run_executor.shutdown)
++
++    def test_pause_precedes_registry_calls_quota_and_persistence(self):
++        with patch("posttrain_infra.submission.prepare_submission") as prepare, \
++                patch.object(self.state, "save_submission") as save, \
++                patch.object(self.state, "slot_block") as quota:
++            with self.assertRaises(errors.ArenaInfrastructureError) as raised:
++                self.controller.submit({"submission_id": "dev-check"}, owner="space:burtenshaw")
++        self.assertEqual(raised.exception.code, errors.CAPACITY_BUSY)
++        self.assertEqual(raised.exception.status, 503)
++        self.assertEqual(raised.exception.retry_after_s, 60)
++        prepare.assert_not_called()
++        save.assert_not_called()
++        quota.assert_not_called()
++        self.assertEqual(self.controller.list_submissions("space:burtenshaw"), [])
++
++    def test_health_and_http_submission_report_readiness(self):
++        server = create_server(self.controller, host="127.0.0.1", port=0, api_token="dev-admin-token")
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        base = f"http://127.0.0.1:{server.server_address[1]}"
++        try:
++            with urlopen(base + "/health", timeout=2) as response:
++                self.assertEqual(json.load(response), {"status": "ok", "submissions_enabled": False})
++            request = Request(base + "/submissions", data=b'{"submission_id":"dev-check"}', method="POST",
++                              headers={"Authorization": "Bearer dev-admin-token", "Content-Type": "application/json"})
++            with self.assertRaises(HTTPError) as raised:
++                urlopen(request, timeout=2)
++            with raised.exception as response:
++                self.assertEqual(response.code, 503)
++                self.assertEqual(response.headers["Retry-After"], "60")
++                self.assertEqual(json.load(response)["code"], errors.CAPACITY_BUSY)
++        finally:
++            server.shutdown()
++            server.server_close()
++            thread.join(timeout=2)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_trackio.py b/tests/test_trackio.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_trackio.py
+@@ -0,0 +1,212 @@
++"""CPU-only coverage of the GPU metrics sender and controller integration."""
++import contextlib
++import io
++import json
++from pathlib import Path
++import shutil
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import AsyncMock, Mock, patch
++from urllib.parse import parse_qs, urlsplit
++
++from posttrain_infra.controller import Controller
++from posttrain_infra.dashboard import Dashboard, read_ingestion_token, valid_url
++from posttrain_infra.state import State
++from posttrain_infra.trainer import GroupFailed, play_until_verified
++
++
++class DashboardTests(unittest.TestCase):
++    def dashboard(self):
++        dashboard = Dashboard(None)
++        dashboard.sender = object()  # Keep rows in memory for deterministic assertions.
++        dashboard.project, dashboard.name = "burtenshaw", "full-arena-run-id"
++        dashboard.config = {"run_id": dashboard.name, "submission_id": "submission"}
++        return dashboard
++
++    def test_step_clock_includes_failed_rollout_retry_and_optimizer(self):
++        dashboard = self.dashboard()
++        clock = [100.0]
++        failure = GroupFailed({"epoch": 0}, [], RuntimeError("failed rollout"))
++        failure.settle = AsyncMock()
++        calls = [0]
++
++        def play():
++            calls[0] += 1
++            clock[0] += 7
++            if calls[0] == 1:
++                raise failure
++            dashboard.note({"step/retries": 1, "step/collection_seconds": 7})
++            return {"verified_score": [1, 0, 1, 0]}
++
++        client = Mock()
++        with patch("posttrain_infra.dashboard.time.monotonic", side_effect=lambda: clock[0]):
++            dashboard.begin_step()
++            play_until_verified(play, client)
++            clock[0] += 3  # Forward/backward and optimizer work after collection.
++            dashboard.log({"loss": 0.25, "reward": 0.5, "reward_std": 0.5, "grad_norm": 0.2,
++                           "completions/mean_length": 25, "invalid": float("nan"), "epoch": "one"}, 1)
++            dashboard.log({"train_runtime": 17}, 1)
++        row, final = dashboard.rows.get_nowait(), dashboard.rows.get_nowait()
++        self.assertEqual(row["metrics"]["step/wall_seconds"], 17)
++        self.assertEqual(row["metrics"]["step/retries"], 1)
++        self.assertEqual(row["metrics"]["step/collection_seconds"], 7)
++        self.assertEqual(row["metrics"]["completions/mean_length"], 25)
++        self.assertNotIn("invalid", row["metrics"])
++        self.assertNotIn("epoch", row["metrics"])
++        self.assertNotIn("step/wall_seconds", final["metrics"])
++        self.assertNotEqual(row["log_id"], final["log_id"])
++        self.assertEqual(row["run"], row["run_id"])
++        failure.settle.assert_awaited_once()
++        client.call.assert_called_once_with("retry", {"epoch": 0, "error": "RuntimeError: failed rollout"})
++
++    def test_ingestion_credential_only_in_authorization_header(self):
++        dashboard = self.dashboard()
++        dashboard.token, dashboard.endpoint = "dedicated-ingestion-secret", "https://metrics.hf.space/ingest"
++        dashboard.log({"loss": 0.2}, 2)
++        entry = dashboard.rows.get_nowait()
++        reply = Mock()
++        reply.__enter__ = Mock(return_value=reply)
++        reply.__exit__ = Mock(return_value=False)
++        reply.read.return_value = b'{"ok":true}'
++        with patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply) as post:
++            dashboard._post([entry])
++        request = post.call_args.args[0]
++        self.assertEqual(request.full_url, dashboard.endpoint)
++        self.assertEqual(request.get_header("Authorization"), "Bearer dedicated-ingestion-secret")
++        self.assertEqual(json.loads(request.data), {"logs": [entry]})
++        self.assertNotIn(dashboard.token.encode(), request.data)
++        self.assertNotIn(b"hf_token", request.data)
++
++    def test_http_retry_reuses_event_and_suppresses_secret_in_errors(self):
++        dashboard = self.dashboard()
++        dashboard.log({"loss": 0.2}, 2)
++        dashboard.rows.put(None)
++        with patch.object(dashboard, "_post", side_effect=RuntimeError("secret-value")) as post, \
++                patch("posttrain_infra.dashboard.time.sleep"), contextlib.redirect_stdout(io.StringIO()) as output:
++            dashboard._send()
++        self.assertEqual(post.call_count, 3)
++        self.assertEqual(post.call_args_list[0], post.call_args_list[2])
++        self.assertNotIn("secret-value", output.getvalue())
++        self.assertIn("training continues", output.getvalue())
++
++    def test_hf_credentials_and_invalid_settings_never_start_sender(self):
++        with tempfile.TemporaryDirectory() as directory:
++            token = Path(directory) / "token"
++            for value in ("hf_not-a-dashboard-credential", "", "token\nheader"):
++                token.write_text(value)
++                with self.assertRaises(ValueError):
++                    read_ingestion_token(str(token))
++                dashboard = Dashboard({"url": "https://metrics.hf.space", "token_file": str(token),
++                                       "project": "burtenshaw", "name": "full-run-id"})
++                with contextlib.redirect_stdout(io.StringIO()) as output:
++                    dashboard.start({})
++                self.assertIsNone(dashboard.sender)
++                if value:
++                    self.assertNotIn(value, output.getvalue())
++        for value in ("http://metrics.hf.space", "https://secret@metrics.hf.space", "https://", "https://host/?token=x"):
++            self.assertFalse(valid_url(value))
++
++    def test_disabled_dashboard_does_not_affect_training(self):
++        dashboard = Dashboard(None)
++        dashboard.start({})
++        dashboard.begin_step()
++        dashboard.note({"step/retries": 0})
++        dashboard.log({"loss": 0.1}, 1)
++        dashboard.finish()
++        self.assertTrue(dashboard.rows.empty())
++
++    def test_unsupported_numbers_do_not_interrupt_optimizer_logging(self):
++        dashboard = self.dashboard()
++        dashboard.log({"loss": 0.25, "huge_int": 10 ** 1000, "too_large": 2 ** 63,
++                       "too_small": -(2 ** 63) - 1, "boolean": True, "infinity": float("inf"),
++                       "maximum": 2 ** 63 - 1, "minimum": -(2 ** 63)}, 1)
++        self.assertEqual(dashboard.rows.get_nowait()["metrics"],
++                         {"loss": 0.25, "maximum": 2 ** 63 - 1, "minimum": -(2 ** 63)})
++
++
++class ControllerTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        self.secret = self.root / "ingest-token"
++        self.secret.write_text("dedicated-ingestion-secret")
++        self.config = {"slurm": {"partition": "gpu", "gpu_type": "h200", "shared_directory": str(self.root)},
++                       "controller_url": "https://controller.example", "trackio": {
++                           "url": "https://metrics.hf.space", "token_file": str(self.secret), "project": "legacy"}}
++        self.state = State(str(self.root / "state.sqlite"))
++
++    def controller(self, **settings):
++        controller = Controller(self.state, {**self.config, **settings})
++        self.addCleanup(controller.validation_executor.shutdown)
++        self.addCleanup(controller.run_executor.shutdown)
++        return controller
++
++    def stage(self, controller, owner="space:burtenshaw"):
++        record, token = self.state.create_run({"submission_id": "same-submission"}, "slurm", owner)
++        submission = SimpleNamespace(submission_id="same-submission", to_dict=lambda: {"submission_id": "same-submission"})
++        stage = controller._slurm_stage(record, submission, token)
++        return record, stage
++
++    def test_per_user_project_full_run_ids_and_durable_links(self):
++        controller = self.controller()
++        first, stage = self.stage(controller)
++        second, _ = self.stage(controller)
++        other, _ = self.stage(controller, "space:another-user")
++        settings = json.loads((stage / "trackio.json").read_text())
++        self.assertEqual(settings["project"], "burtenshaw")
++        self.assertEqual(settings["name"], first["run_id"])
++        self.assertEqual(settings["config"]["run_id"], first["run_id"])
++        self.assertEqual((stage / "trackio-token").stat().st_mode & 0o777, 0o600)
++        shutil.rmtree(self.root / "runs")
++        for record, expected_project in ((first, "burtenshaw"), (second, "burtenshaw"), (other, "another-user")):
++            query = parse_qs(urlsplit(controller.dashboard_link(record["owner"], "same-submission", record["run_id"])).query)
++            self.assertEqual(query, {"project": [expected_project], "runs": [record["run_id"]]})
++        self.assertNotEqual(first["run_id"], second["run_id"])
++        self.assertNotEqual(controller._dashboard_project("burtenshaw"), "burtenshaw")
++        self.assertRegex(controller._dashboard_project("delegate:unsafe/user"), r"^principal-[a-f0-9]{64}$")
++
++    def test_legacy_links_use_staged_settings_then_original_naming(self):
++        controller = self.controller()
++        record, _ = self.state.create_run({"submission_id": "old"}, "slurm", "space:burtenshaw")
++        stage = self.root / "runs" / record["run_id"] / "attempt-0"
++        stage.mkdir(parents=True)
++        staged = stage / "trackio.json"
++        staged.write_text(json.dumps({"url": "https://old.hf.space", "project": "old-project", "name": "user/old"}))
++        link = controller.dashboard_link(record["owner"], "old", record["run_id"])
++        self.assertEqual(link, "https://old.hf.space/?project=old-project&runs=user%2Fold")
++        staged.unlink()
++        with patch.object(self.state, "submission", return_value={"run": {"run_id": record["run_id"]}}):
++            link = controller.dashboard_link(record["owner"], "old", record["run_id"])
++        self.assertEqual(link, "https://metrics.hf.space/?project=legacy&runs=burtenshaw%2Fold")
++
++    def test_exemption_is_exact_and_does_not_grant_operator_permissions(self):
++        controller = self.controller(submission_quota_exempt_subjects=["space:burtenshaw"])
++        self.assertIsNone(controller._owner_submission_quota("space:burtenshaw"))
++        for subject in ("burtenshaw", "space:another-user", "space:burtenshaw-other"):
++            self.assertEqual(controller._owner_submission_quota(subject), {"limit": 1, "window_s": 86400})
++        self.assertNotIn("space:burtenshaw", controller.operators)
++        controller.submission_run = {"configured": True}
++        with self.assertRaisesRegex(ValueError, "Arena starts"):
++            controller.create_run({}, owner="space:burtenshaw")
++
++    def test_default_exemptions_empty_and_legacy_project_optional(self):
++        config = {key: value for key, value in self.config["trackio"].items() if key != "project"}
++        controller = self.controller(trackio=config)
++        self.assertEqual(controller._owner_submission_quota("space:burtenshaw"), {"limit": 1, "window_s": 86400})
++        self.assertEqual(controller.submission_quota_exempt_subjects, set())
++
++    def test_hf_credential_never_staged_on_gpu(self):
++        self.secret.write_text("hf_do-not-send-this-to-the-gpu")
++        controller = self.controller()
++        with self.assertLogs("posttrain_infra.controller", level="WARNING") as output:
++            _, stage = self.stage(controller)
++        self.assertFalse((stage / "trackio-token").exists())
++        self.assertFalse((stage / "trackio.json").exists())
++        self.assertNotIn("hf_do-not-send", "".join(output.output))
++        self.assertTrue((stage / "trainer.sh").exists())
++
++
++if __name__ == "__main__":
++    unittest.main()
