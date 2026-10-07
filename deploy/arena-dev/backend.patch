@@ -18,11 +18,12 @@ diff --git a/docs/trackio.md b/docs/trackio.md
 new file mode 100644
 --- /dev/null
 +++ b/docs/trackio.md
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,122 @@
 +# Trackio backend integration
 +
-+This directory contains the deployed `posttrain_infra` source with the Trackio integration changes. It is a source
-+snapshot, not the authoritative Git repository. Run its CPU-only checks with:
++This note describes the `posttrain_infra` Trackio integration and optional CPU simulation. Paths and commands below
++are relative to the backend source root, including when this note is installed as `docs/trackio.md`. Run its CPU-only
++checks from that root with:
 +
 +```sh
 +PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -79,7 +80,8 @@ new file mode 100644
 +Create both SQLite databases under the local filesystem `/tmp/arena-dev/sql` and back them up to the dev directory.
 +The server's `/home` is NFS and `/data` is shared storage; neither is the intended live SQLite filesystem.
 +
-+The examples default `submissions_enabled` to false. This leaves reads and the bridge available while returning a
++The optional real-training templates set `submissions_enabled` to false until infrastructure is ready. This leaves
++reads and the bridge available while returning a
 +retryable 503 before any submission registry call, quota reservation, persistence, admission, or training enqueue.
 +`GET /health` reports both process liveness and `submissions_enabled`. Existing work is not paused by this flag; start
 +the dev deployment with its own empty database. Enable real training submissions only after its restricted HF execution token,
@@ -105,8 +107,8 @@ new file mode 100644
 +The host uses supervisord rather than systemd. Its existing read-only supervisor executable is
 +`/data/arena/venvs/ops/bin/supervisord`; launch it with a separate dev configuration, PID file, socket, and logs.
 +On 2026-10-07, all GPU workers were in reservation `arena` for user `carrie`, and a no-allocation `sbatch --test-only`
-+check rejected an allocation for `ben`. Do not override that reservation or enable training until an approved
-+allocation is available. No development process or GPU job was started while preparing these examples.
++check rejected an allocation for `ben`. Do not override that reservation or enable real training until an approved
++allocation is available. The CPU simulation below does not require a GPU allocation.
 +
 +For a CPU-only end-to-end test, set the controller to:
 +
