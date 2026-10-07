@@ -1,0 +1,537 @@
+diff --git a/src/posttrain_infra/bridge.py b/src/posttrain_infra/bridge.py
+index 601805f..3fb7c86 100644
+--- a/src/posttrain_infra/bridge.py
++++ b/src/posttrain_infra/bridge.py
+@@ -25,13 +25,14 @@ import urllib.request
+ from urllib.parse import urlsplit
+ 
+ from . import errors
++from .leaderboard import CURSOR_PATTERN
+ from .runtime import MAX_RPC_BYTES, _NoRedirect
+ 
+ LOG = logging.getLogger(__name__)
+ _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+ SUBJECT = re.compile(_ID)
+ # The participant API. Any other request answers 404 here, whatever the front end forwards.
+-PUBLIC_ROUTES = re.compile(rf"POST /submissions|GET /submissions(/{_ID})?|GET /runs/{_ID}(/events)?|(GET|POST) /messages")
++PUBLIC_ROUTES = re.compile(rf"POST /submissions|GET /submissions(/{_ID})?|GET /runs/{_ID}(/events)?|(GET|POST) /messages|GET /leaderboard(/{CURSOR_PATTERN})?")
+ RECONNECT_S = (1, 2, 5, 10, 30)
+ 
+ 
+diff --git a/src/posttrain_infra/controller.py b/src/posttrain_infra/controller.py
+index 75c7a4c..5afb912 100644
+--- a/src/posttrain_infra/controller.py
++++ b/src/posttrain_infra/controller.py
+@@ -410,6 +410,25 @@ class Controller:
+         """The owner's own submissions, newest first: what a participant's My submissions shows."""
+         return [self._summary(self.state.submission(identifier)) for identifier in self.state.owner_submissions(owner, 50)]
+ 
++    def record_evaluation(self, identifier: str, value: dict) -> dict:
++        return self.state.save_evaluation(identifier, value)
++
++    def leaderboard(self, cursor: str | None = None) -> dict:
++        from .leaderboard import BENCHMARK, CURSOR_PATTERN, PAGE_SIZE, leaderboard
++        snapshot, offset = None, 0
++        if cursor is not None:
++            if type(cursor) is not str or not re.fullmatch(CURSOR_PATTERN, cursor):
++                raise ValueError("Invalid leaderboard cursor")
++            snapshot, offset = map(int, cursor.split("-"))
++            if max(snapshot, offset) > 2**63 - 1:
++                raise ValueError("Invalid leaderboard cursor")
++        snapshot, results = self.state.evaluation_snapshot(BENCHMARK, snapshot)
++        board = leaderboard(results)
++        end = offset + PAGE_SIZE
++        more = end < max(len(board["entries"]), len(board["runs"]))
++        return {**board, "entries": board["entries"][offset:end], "runs": board["runs"][offset:end],
++                "next_cursor": f"{snapshot}-{end}" if more else None}
++
+     def _author(self, owner: str) -> str:
+         """How a message's author is shown: the Hugging Face name of a participant, the arena for operators."""
+         if owner.startswith("space:"):
+diff --git a/src/posttrain_infra/leaderboard.py b/src/posttrain_infra/leaderboard.py
+new file mode 100644
+index 0000000..7aa013f
+--- /dev/null
++++ b/src/posttrain_infra/leaderboard.py
+@@ -0,0 +1,94 @@
++"""Public held-out results, with provenance derived from Arena's stored records."""
++from __future__ import annotations
++
++import re
++
++from . import errors
++from .contracts import parse_dataset_name
++
++BENCHMARK = "heldout-v1"
++TASKS_PER_DOMAIN = 5
++PAGE_SIZE = 50
++CURSOR_PATTERN = r"(?:0|[1-9][0-9]{0,18})-(?:0|[1-9][0-9]{0,18})"
++DOMAINS = [
++    {"id": "software-engineering", "name": "Software engineering", "short": "Software"},
++    {"id": "industrial-physical-systems", "name": "Industrial & physical systems", "short": "Industrial"},
++    {"id": "natural-science", "name": "Natural science", "short": "Science"},
++    {"id": "office-white-collar", "name": "Office & white-collar", "short": "Office"},
++    {"id": "finance-economics", "name": "Finance & economics", "short": "Finance"},
++    {"id": "mathematics-or-formal-reasoning", "name": "Math & formal reasoning", "short": "Math"},
++    {"id": "cybersecurity", "name": "Cybersecurity", "short": "Security"},
++    {"id": "media-content-production", "name": "Media & content production", "short": "Media"},
++]
++DOMAIN_IDS = tuple(domain["id"] for domain in DOMAINS)
++
++
++def validate_evaluation(value: dict) -> dict:
++    """Accept a complete aggregate result only; task contents never enter this API."""
++    if type(value) is not dict or set(value) != {"benchmark", "scores"}:
++        raise ValueError("An evaluation contains only benchmark and scores")
++    if value["benchmark"] != BENCHMARK:
++        raise ValueError(f"benchmark must be {BENCHMARK}")
++    scores = value["scores"]
++    if type(scores) is not dict or set(scores) != set(DOMAIN_IDS):
++        raise ValueError("Evaluation requires all eight benchmark domains exactly once")
++    for score in scores.values():
++        if (type(score) is not dict or set(score) != {"solved", "total"}
++                or type(score["solved"]) is not int or type(score["total"]) is not int
++                or score["total"] != TASKS_PER_DOMAIN or not 0 <= score["solved"] <= TASKS_PER_DOMAIN):
++            raise ValueError("Each domain requires integer solved in [0, 5] and total=5")
++    return {"benchmark": BENCHMARK, "scores": {domain: dict(scores[domain]) for domain in DOMAIN_IDS}}
++
++
++def result_for_run(run: dict, submission: dict, evaluation: dict) -> dict:
++    """Bind an operator result to the completed run and its immutable submitted dataset."""
++    spec = run["spec"]
++    if (run.get("state") != "completed" or run.get("node") != "slurm" or spec.get("provider") != "slurm"
++            or type(run.get("policy_version")) is not int or run["policy_version"] < 1
++            or not run.get("checkpoint") or run.get("error") or run.get("error_code")
++            or any(record.get(flag) for record in (run, spec) for flag in ("simulated", "simulation", "dry_run"))):
++        raise errors.ArenaError("EVALUATION_RUN_INELIGIBLE", "Evaluation requires a completed real training run with a committed checkpoint", 409)
++    owner = run.get("owner", "")
++    if (not re.fullmatch(r"space:[A-Za-z0-9][A-Za-z0-9_-]{0,63}", owner)
++            or submission.get("owner") != owner or submission.get("state") != "validated"
++            or submission.get("report", {}).get("admissible") is not True):
++        raise errors.ArenaError("EVALUATION_RUN_INELIGIBLE", "Evaluation requires an admitted submission owned by the run's verified Hugging Face user", 409)
++    submitted = submission["spec"]
++    if submitted.get("submission_id") != spec.get("submission_id"):
++        raise errors.ArenaError("EVALUATION_RUN_INELIGIBLE", "Run and submission identities differ", 409)
++    dataset = submitted.get("dataset")
++    if (type(dataset) is not dict or set(dataset) != {"repo", "revision"}
++            or type(dataset.get("revision")) is not str or not re.fullmatch(r"[a-f0-9]{40}", dataset["revision"])):
++        raise errors.ArenaError("EVALUATION_DATASET_REQUIRED", "A pinned Hugging Face dataset is required to rank this run", 409)
++    repo = parse_dataset_name(dataset["repo"])
++    dataset = {**dataset, "url": f"https://huggingface.co/datasets/{repo}/tree/{dataset['revision']}"}
++    return {"benchmark": evaluation["benchmark"], "run_id": run["run_id"], "user": owner[6:],
++            "submission_id": submitted["submission_id"], "name": errors.sanitize(submitted.get("name", ""), 256),
++            "tasks": sum(task.get("split") == "train" for task in submitted.get("tasks", [])),
++            "dataset": dataset, "scores": evaluation["scores"]}
++
++
++def leaderboard(results: list[dict]) -> dict:
++    """Each user's best result per domain; equal scores keep the first recorded winner."""
++    entries, runs = {}, []
++    for result in results:
++        if result["benchmark"] != BENCHMARK:
++            continue
++        user = result["user"]
++        entry = entries.setdefault(user, {"user": user, "runs": 0, "scores": {}})
++        entry["runs"] += 1
++        scores = {domain: {**score, "score": score["solved"] / score["total"]}
++                  for domain, score in result["scores"].items()}
++        runs.append({**result, "scores": scores, "solved": sum(score["solved"] for score in scores.values()),
++                     "total": len(DOMAIN_IDS) * TASKS_PER_DOMAIN})
++        for domain, score in scores.items():
++            previous = entry["scores"].get(domain)
++            if previous is None or score["score"] > previous["score"]:
++                entry["scores"][domain] = {**score, "run_id": result["run_id"],
++                    "submission_id": result["submission_id"], "dataset": dict(result["dataset"])}
++    for entry in entries.values():
++        entry["average"] = sum(entry["scores"][domain]["solved"] for domain in DOMAIN_IDS) / (len(DOMAIN_IDS) * TASKS_PER_DOMAIN)
++    return {"benchmark": BENCHMARK, "tasks_per_domain": TASKS_PER_DOMAIN,
++            "domains": [dict(domain) for domain in DOMAINS],
++            "entries": sorted(entries.values(), key=lambda entry: (-entry["average"], entry["user"].casefold(), entry["user"])),
++            "runs": runs}
+diff --git a/src/posttrain_infra/server.py b/src/posttrain_infra/server.py
+index 8aa0404..b2cde26 100644
+--- a/src/posttrain_infra/server.py
++++ b/src/posttrain_infra/server.py
+@@ -362,6 +362,15 @@ class Handler(BaseHTTPRequestHandler):
+ 
+     def public(self, parts: list[str]):
+         controller = self.server.controller
++        if parts[0] == "leaderboard" and len(parts) in (1, 2) and self.command == "GET":
++            self.principal("read")
++            return self.reply(200, controller.leaderboard(parts[1] if len(parts) == 2 else None))
++        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "evaluation" and self.command == "POST":
++            if "admin" not in self.principal("admin")["roles"]:
++                raise APIError(403, "Recording an evaluation requires the administrator role")
++            if not _ID.fullmatch(parts[1]):
++                raise APIError(404, "Resource not found")
++            return self.reply(200, controller.record_evaluation(parts[1], self.body()))
+         if parts == ["submissions"] and self.command == "POST":
+             principal = self.principal("submit")
+             value = self.body()
+@@ -428,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
+             parts = self.path_parts()
+             if parts == ["health"] and self.command == "GET":
+                 return self.reply(200, {"status": "ok"})
+-            self.route = parts[0] if parts[0] in {"submissions", "runs", "internal", "messages"} else "unknown"
++            self.route = parts[0] if parts[0] in {"submissions", "runs", "internal", "messages", "leaderboard"} else "unknown"
+             return self.internal(parts) if parts[0] == "internal" else self.public(parts)
+         except (BrokenPipeError, ConnectionResetError):
+             self.close_connection = True
+diff --git a/src/posttrain_infra/state.py b/src/posttrain_infra/state.py
+index 653e6c4..caad313 100644
+--- a/src/posttrain_infra/state.py
++++ b/src/posttrain_infra/state.py
+@@ -70,6 +70,9 @@ class State:
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, body TEXT NOT NULL,
+                   created_at REAL NOT NULL, hidden INTEGER NOT NULL DEFAULT 0);
+                 CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, created_at);
++                CREATE TABLE IF NOT EXISTS evaluations (
++                  run_id TEXT NOT NULL, benchmark TEXT NOT NULL, evaluation TEXT NOT NULL,
++                  result TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(run_id,benchmark));
+             """)
+ 
+     @contextmanager
+@@ -152,6 +155,49 @@ class State:
+             return [row[0] for row in database.execute(
+                 "SELECT id FROM submissions WHERE owner=? ORDER BY rowid DESC LIMIT ?", (owner, limit))]
+ 
++    def save_evaluation(self, identifier: str, value: dict) -> dict:
++        """Record one immutable result; read eligibility and provenance in the same transaction."""
++        from .leaderboard import result_for_run, validate_evaluation
++        evaluation = validate_evaluation(value)
++        encoded = encode(evaluation)
++        with self.transaction() as database:
++            existing = database.execute("SELECT evaluation,result FROM evaluations WHERE run_id=? AND benchmark=?",
++                                        (identifier, evaluation["benchmark"])).fetchone()
++            if existing is not None:
++                if existing["evaluation"] != encoded:
++                    raise errors.ArenaError("EVALUATION_CONFLICT", "Run already has a different immutable evaluation for this benchmark", 409)
++                return json.loads(existing["result"])
++            row = database.execute("SELECT spec,record FROM runs WHERE id=?", (identifier,)).fetchone()
++            if row is None:
++                raise KeyError(identifier)
++            run = json.loads(row["record"])
++            run["spec"] = json.loads(row["spec"])
++            row = database.execute("SELECT spec,state,owner,report FROM submissions WHERE id=?",
++                                   (run["spec"]["submission_id"],)).fetchone()
++            if row is None:
++                raise KeyError(run["spec"]["submission_id"])
++            submission = {"spec": json.loads(row["spec"]), "report": json.loads(row["report"]),
++                          "state": row["state"], "owner": row["owner"]}
++            result = result_for_run(run, submission, evaluation)
++            database.execute("INSERT INTO evaluations VALUES (?,?,?,?,?)",
++                             (identifier, evaluation["benchmark"], encoded, encode(result), time.time()))
++            return result
++
++    def evaluations(self, benchmark: str) -> list[dict]:
++        return self.evaluation_snapshot(benchmark)[1]
++
++    def evaluation_snapshot(self, benchmark: str, snapshot: int | None = None) -> tuple[int, list[dict]]:
++        """Freeze the append-only history so every leaderboard page sees the same results."""
++        with self.transaction() as database:
++            latest = database.execute("SELECT COALESCE(MAX(rowid),0) FROM evaluations").fetchone()[0]
++            if snapshot is None:
++                snapshot = latest
++            elif type(snapshot) is not int or not 0 <= snapshot <= latest:
++                raise ValueError("Leaderboard cursor names an unavailable snapshot")
++            rows = database.execute("SELECT result FROM evaluations WHERE benchmark=? AND rowid<=? ORDER BY created_at,rowid",
++                                    (benchmark, snapshot)).fetchall()
++        return snapshot, [json.loads(row["result"]) for row in rows]
++
+     def add_message(self, owner: str, body: str, *, min_interval_s: float, daily_limit: int) -> dict:
+         """Store one message, unless the owner posted within ``min_interval_s`` or ``daily_limit`` times in 24 h."""
+         now = time.time()
+diff --git a/tests/test_leaderboard.py b/tests/test_leaderboard.py
+new file mode 100644
+index 0000000..79d6d19
+--- /dev/null
++++ b/tests/test_leaderboard.py
+@@ -0,0 +1,288 @@
++import hashlib
++import json
++import threading
++import urllib.error
++import urllib.request
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from posttrain_infra.bridge import PUBLIC_ROUTES, forward
++from posttrain_infra.controller import Controller
++from posttrain_infra.errors import ArenaError
++from posttrain_infra.leaderboard import BENCHMARK, DOMAIN_IDS, leaderboard, validate_evaluation
++from posttrain_infra.server import create_server
++from posttrain_infra.state import State, encode
++from posttrain_infra.runtime import MAX_RPC_BYTES, encode_json
++
++
++def evaluation(default=0, **overrides):
++    return {"benchmark": BENCHMARK, "scores": {
++        domain: {"solved": overrides.get(domain, default), "total": 5} for domain in DOMAIN_IDS}}
++
++
++def completed_run(store, identifier="submission-one", user="alice", name="Training environment", **changes):
++    submission = {"submission_id": identifier, "name": name,
++                  "dataset": {"repo": f"{user}/{identifier}", "revision": "a" * 40},
++                  "tasks": [{"task_id": "private-task-must-not-appear", "split": "train"},
++                            {"task_id": "private-evaluation-task", "split": "eval"}]}
++    store.save_submission(submission, {"admissible": True}, "validated", f"space:{user}")
++    run, _ = store.create_run({"submission_id": identifier, "provider": "slurm"}, "slurm", f"space:{user}")
++    store.update(run["run_id"], lambda record: record.update(
++        {"state": "completed", "policy_version": 1, "checkpoint": {"key": "committed", "sha256": "b" * 64}, **changes}))
++    return run["run_id"]
++
++
++@pytest.fixture
++def state(tmp_path):
++    return State(str(tmp_path / "arena.db"))
++
++
++def test_durable_per_user_domain_maxima_and_winning_datasets(state):
++    first = completed_run(state)
++    second = completed_run(state, "submission-two")
++    lower = completed_run(state, "submission-three")
++    bob = completed_run(state, "submission-bob", "bob")
++    state.save_evaluation(first, evaluation(**{DOMAIN_IDS[0]: 5, DOMAIN_IDS[1]: 1}))
++    state.save_evaluation(second, evaluation(**{DOMAIN_IDS[0]: 2, DOMAIN_IDS[1]: 4}))
++    state.save_evaluation(lower, evaluation(0))
++    state.save_evaluation(bob, evaluation(1))
++    reopened = State(state.path)
++    board = leaderboard(reopened.evaluations(BENCHMARK))
++    alice = board["entries"][0]
++    assert alice["user"] == "alice"
++    assert alice["runs"] == 3
++    assert alice["average"] == pytest.approx((1 + .8) / 8)
++    assert alice["scores"][DOMAIN_IDS[0]]["run_id"] == first
++    assert alice["scores"][DOMAIN_IDS[1]]["run_id"] == second
++    assert alice["scores"][DOMAIN_IDS[0]]["dataset"]["repo"] == "alice/submission-one"
++    assert alice["scores"][DOMAIN_IDS[1]]["dataset"]["repo"] == "alice/submission-two"
++    assert alice["scores"][DOMAIN_IDS[1]]["dataset"]["url"].endswith("/tree/" + "a" * 40)
++    assert len(board["runs"]) == 4
++    assert board["runs"][0]["tasks"] == 1
++    assert board["runs"][0]["solved"] == 6
++    assert board["runs"][0]["total"] == 40
++    assert "private-task" not in json.dumps(board)
++    assert "private-evaluation" not in json.dumps(board)
++    assert "checkpoint" not in json.dumps(board)
++
++
++def test_idempotent_atomic_replay_and_conflict(state):
++    identifier = completed_run(state)
++    value = evaluation(2)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda _: state.save_evaluation(identifier, value), range(2)))
++    assert results[0] == results[1]
++    assert len(State(state.path).evaluations(BENCHMARK)) == 1
++    with pytest.raises(ArenaError) as raised:
++        state.save_evaluation(identifier, evaluation(3))
++    assert raised.value.status == 409
++    assert raised.value.code == "EVALUATION_CONFLICT"
++    assert state.evaluations(BENCHMARK)[0] == results[0]
++
++
++def test_stable_ties_and_current_benchmark_only(state):
++    bob = completed_run(state, "bob-one", "bob")
++    alice = completed_run(state)
++    alice_again = completed_run(state, "alice-two")
++    state.save_evaluation(bob, evaluation(**{DOMAIN_IDS[0]: 5, DOMAIN_IDS[1]: 3}))
++    for identifier in (alice, alice_again):
++        state.save_evaluation(identifier, evaluation(1))
++    with state.transaction() as database:
++        database.execute("INSERT INTO evaluations VALUES (?,?,?,?,?)", (
++            "historical", "retired", "{}", encode({"benchmark": "retired", "private": "old"}), 0))
++    board = leaderboard(state.evaluations(BENCHMARK))
++    assert [entry["user"] for entry in board["entries"]] == ["alice", "bob"]
++    assert all(score["run_id"] == alice for score in board["entries"][0]["scores"].values())
++    assert len(board["runs"]) == 3
++    assert len(state.evaluations("retired")) == 1
++
++
++@pytest.mark.parametrize("change", [
++    lambda value: value.update(user="mallory"),
++    lambda value: value.update(dataset={"repo": "mallory/forged", "revision": "a" * 40}),
++    lambda value: value.update(benchmark="other"),
++    lambda value: value["scores"].pop(DOMAIN_IDS[0]),
++    lambda value: value["scores"].update(unknown={"solved": 0, "total": 5}),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(total=4),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(solved=6),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(solved=-1),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(solved=True),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(solved=1.0),
++    lambda value: value["scores"][DOMAIN_IDS[0]].update(tasks=["secret"]),
++])
++def test_only_complete_aggregate_evaluations_allowed(change):
++    value = evaluation()
++    change(value)
++    with pytest.raises(ValueError):
++        validate_evaluation(value)
++
++
++@pytest.mark.parametrize("changes", [
++    {"state": "failed"}, {"state": "running"}, {"state": "cleanup"}, {"node": "simulated"},
++    {"simulated": True}, {"simulation": True}, {"dry_run": True}, {"checkpoint": None},
++    {"policy_version": 0}, {"error": "failed"}, {"error_code": "CLEANUP_FORCE_RELEASED"},
++    {"owner": "space:mallory"}, {"owner": "local"},
++])
++def test_unrankable_runs_rejected(state, changes):
++    identifier = completed_run(state, **changes)
++    with pytest.raises(ArenaError, match="Evaluation requires"):
++        state.save_evaluation(identifier, evaluation())
++    assert not state.evaluations(BENCHMARK)
++
++
++def test_missing_pinned_dataset_is_clear_error(state):
++    identifier = completed_run(state)
++    with state.transaction() as database:
++        row = database.execute("SELECT spec FROM submissions").fetchone()
++        spec = json.loads(row[0])
++        spec.pop("dataset")
++        database.execute("UPDATE submissions SET spec=?", (encode(spec),))
++    with pytest.raises(ArenaError) as raised:
++        state.save_evaluation(identifier, evaluation())
++    assert raised.value.code == "EVALUATION_DATASET_REQUIRED"
++    assert raised.value.status == 409
++
++
++def test_provenance_uses_immutable_run_spec(state):
++    identifier = completed_run(state)
++    completed_run(state, "different-dataset")
++    state.update(identifier, lambda record: record["spec"].update(submission_id="different-dataset"))
++    result = state.save_evaluation(identifier, evaluation())
++    assert result["submission_id"] == "submission-one"
++    assert result["dataset"]["repo"] == "alice/submission-one"
++
++
++def test_unadmitted_submission_is_not_ranked(state):
++    identifier = completed_run(state)
++    original = state.submission("submission-one")
++    state.save_submission(original["spec"], {"admissible": False}, "rejected", original["owner"])
++    with pytest.raises(ArenaError, match="admitted submission"):
++        state.save_evaluation(identifier, evaluation())
++
++
++@pytest.fixture
++def api(state, tmp_path):
++    controller = Controller.__new__(Controller)
++    controller.state = state
++    controller.config = {"transfer_directory": str(tmp_path / "transfers"), "client_tokens": {
++        hashlib.sha256(token.encode()).hexdigest(): {"subject": subject, "roles": roles}
++        for token, subject, roles in [("participant-token", "alice", ["user"]),
++                                      ("read-token", "reader", ["read"]),
++                                      ("delegate-token", "space", ["delegate"]),
++                                      ("submit-token", "submitter", ["submit"])]}}
++    server = create_server(controller, port=0, api_token="admin-token")
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++
++    def request(method, path, value=None, token=None, subject=None):
++        headers = {"Content-Type": "application/json"}
++        if token:
++            headers["Authorization"] = f"Bearer {token}"
++        if subject:
++            headers["X-Arena-Subject"] = subject
++        body = None if value is None else json.dumps(value).encode()
++        req = urllib.request.Request(f"http://127.0.0.1:{server.server_port}{path}", data=body, headers=headers, method=method)
++        try:
++            response = urllib.request.urlopen(req)
++        except urllib.error.HTTPError as error:
++            response = error
++        with response:
++            return response.status, json.load(response)
++
++    yield request
++    server.shutdown()
++    server.server_close()
++    thread.join()
++
++
++def test_http_admin_only_write_read_roles_and_conflict(api, state):
++    identifier = completed_run(state)
++    path = f"/runs/{identifier}/evaluation"
++    assert api("POST", path, evaluation())[0] == 401
++    assert api("POST", path, evaluation(), "participant-token")[0] == 403
++    assert api("POST", path, evaluation(), "read-token")[0] == 403
++    assert api("POST", path, evaluation(), "delegate-token", "alice")[0] == 403
++    assert not state.evaluations(BENCHMARK)
++    assert api("POST", path, evaluation(1), "admin-token")[0] == 200
++    assert api("POST", path, evaluation(1), "admin-token")[0] == 200
++    assert api("POST", path, evaluation(2), "admin-token")[0] == 409
++    assert api("GET", "/leaderboard")[0] == 401
++    assert api("GET", "/leaderboard", token="submit-token")[0] == 403
++    assert api("GET", "/leaderboard", token="read-token")[1]["entries"][0]["user"] == "alice"
++    assert api("GET", "/leaderboard", token="delegate-token", subject="bob")[0] == 200
++    assert api("POST", path, {**evaluation(), "user": "mallory"}, "admin-token")[0] == 400
++
++
++def test_bridge_exposes_only_leaderboard_read():
++    assert PUBLIC_ROUTES.fullmatch("GET /leaderboard")
++    assert PUBLIC_ROUTES.fullmatch("GET /leaderboard/149-50")
++    assert not PUBLIC_ROUTES.fullmatch("POST /leaderboard")
++    assert not PUBLIC_ROUTES.fullmatch("POST /leaderboard/149-50")
++    assert not PUBLIC_ROUTES.fullmatch("GET /leaderboard/-149-50")
++    assert not PUBLIC_ROUTES.fullmatch("POST /runs/abc/evaluation")
++    reply = forward("http://unused.invalid", "unused", {
++        "method": "POST", "path": "/runs/abc/evaluation", "subject": "alice", "body": ""}, timeout_s=1)
++    assert reply["status"] == 404
++
++
++def test_http_pages_149_users_below_rpc_limit_and_freezes_snapshot(api, state):
++    users = [f"u{index:03}" + "x" * 60 for index in range(149)]
++    for index, user in enumerate(users):
++        identifier = completed_run(state, "s" + "x" * 92 + f"{index:03}", user, name="雪" * 256)
++        state.save_evaluation(identifier, evaluation(index % 5))
++    expected = leaderboard(state.evaluations(BENCHMARK))
++    status, page = api("GET", "/leaderboard", token="read-token")
++    assert status == 200
++    assert page["next_cursor"] == "149-50"
++    # This would change both ranking and a user's maxima if later pages reread live history.
++    new_run = completed_run(state, "new-winner", users[-1])
++    state.save_evaluation(new_run, evaluation(5))
++    entries, runs, lengths = [], [], []
++    while True:
++        assert len(encode_json(page)) < MAX_RPC_BYTES
++        assert len(page["entries"]) <= 50 and len(page["runs"]) <= 50
++        assert page["benchmark"] == BENCHMARK
++        lengths.append((len(page["entries"]), len(page["runs"])))
++        entries.extend(page["entries"])
++        runs.extend(page["runs"])
++        if page["next_cursor"] is None:
++            break
++        status, page = api("GET", "/leaderboard/" + page["next_cursor"], token="read-token")
++        assert status == 200
++    assert lengths == [(50, 50), (50, 50), (49, 49)]
++    assert entries == expected["entries"]
++    assert runs == expected["runs"]
++    assert new_run not in {run["run_id"] for run in runs}
++    status, fresh = api("GET", "/leaderboard", token="read-token")
++    assert status == 200
++    assert fresh["next_cursor"] == "150-50"
++    assert fresh["entries"][0]["user"] == users[-1]
++
++
++def test_pages_continue_until_both_collections_exhausted(state):
++    for index in range(51):
++        identifier = completed_run(state, f"submission-{index}")
++        state.save_evaluation(identifier, evaluation())
++    controller = Controller.__new__(Controller)
++    controller.state = state
++    first = controller.leaderboard()
++    assert len(first["entries"]) == 1 and len(first["runs"]) == 50
++    second = controller.leaderboard(first["next_cursor"])
++    assert second["entries"] == [] and len(second["runs"]) == 1
++    assert second["next_cursor"] is None
++
++
++@pytest.mark.parametrize("cursor", ["-1-0", "1--1", "1.0-0", "1", "a-0", "1-0-0", "01-0",
++                                   "1-00", "1e2-0", "9223372036854775808-0", "0-9223372036854775808"])
++def test_invalid_cursors_rejected(api, cursor):
++    assert api("GET", f"/leaderboard/{cursor}", token="read-token")[0] == 400
++
++
++def test_unavailable_snapshot_and_page_auth(api):
++    assert api("GET", "/leaderboard/1-0", token="read-token")[0] == 400
++    assert api("GET", "/leaderboard/0-0")[0] == 401
++    assert api("GET", "/leaderboard/0-0", token="submit-token")[0] == 403
++    status, page = api("GET", "/leaderboard/0-0", token="read-token")
++    assert status == 200
++    assert page["entries"] == [] and page["runs"] == [] and page["next_cursor"] is None
