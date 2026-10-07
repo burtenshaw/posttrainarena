@@ -1,0 +1,734 @@
+--- a/src/posttrain_infra/controller.py
++++ b/src/posttrain_infra/controller.py
+@@ -21,7 +21,7 @@
+ from .artifacts import artifact_store, digest_file, validate_manifest
+ from .contracts import (MAX_IMAGES, POLICY_VERSION, RESUBMIT, RUN_WALL_S, SUPPORTED_MODEL, RunConfig, Submission,
+                         TaskContract)
+-from .dashboard import read_ingestion_token, valid_url
++from .dashboard import post_alert, read_ingestion_token, valid_url
+ from .lifecycle import GROUP_SETTLE_S, InfrastructureFailure
+ from .limits import environment_limits
+ from .runtime import TransportError
+@@ -44,8 +44,19 @@
+         super().__init__(errors.ADMISSION_DEADLINE_EXCEEDED, message, 408)
+ 
+ 
++def _record_alert(record: dict, title: str, message: str, code: str | None = None) -> None:
++    """Keep the error independent of run state: successful recovery must not erase it."""
++    record["alert"] = {"alert_id": secrets.token_hex(16), "title": title,
++                       "message": errors.sanitize(message, 4000), "level": "ERROR",
++                       "step": record.get("policy_version", 0), "code": code, "delivered": False}
++
++
+ def _begin_cleanup(record: dict, terminal_state: str, error: str | None, code: str | None, now: float) -> None:
+     """Enter cleanup once; the first terminal decision and its error are kept."""
++    if error:
++        checkpoint = (f"Checkpoint at step {record['policy_version']} is retained."
++                      if record.get("checkpoint") else "No committed checkpoint is available.")
++        _record_alert(record, "Training stopped", f"{error} {checkpoint} Training has stopped; cleanup is pending.", code)
+     record.update(state="cleanup", terminal_state=terminal_state, error=error, error_code=code,
+                   cleanup_started_at=now)
+ 
+@@ -131,6 +142,8 @@
+             raise ValueError("max_concurrent_runs must be in [1, 1024]")
+         self.run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="run-start")
+         self.run_start = None
++        self.alert_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="run-alerts")
++        self.alert_delivery = None
+         # Operators may shorten the fixed run budget for a live expiry test only.
+         self.run_wall_s = config.get("run_wall_s", RUN_WALL_S)
+         if type(self.run_wall_s) not in (int, float) or not 60 <= self.run_wall_s <= RUN_WALL_S:
+@@ -375,7 +388,20 @@
+             try:
+                 current = self.state.run(run["run_id"])
+                 run = {**run, "state": current["state"], "policy_version": current["policy_version"],
+-                       "error_code": current.get("error_code")}
++                       "error_code": current.get("error_code"), "error": current.get("error") or run.get("error"),
++                       "checkpoint_available": bool(current.get("checkpoint")),
++                       "group_retries": current.get("group_retries", 0)}
++                alert = current.get("alert")
++                if alert:
++                    run["alert"] = {"level": "ERROR", "message": alert["message"], "url": None}
++                    if alert.get("delivered") and self.dashboard:
++                        identity = current.get("trackio") or self._new_dashboard_identity(record["owner"], run["run_id"])
++                        run["alert"]["url"] = identity["url"].rstrip("/") + "/reports?" + urlencode(
++                            {"project": identity["project"], "runs": identity["name"]})
++                else:
++                    message = current.get("error") or current.get("cleanup_error") or current.get("last_group_error")
++                    if message:
++                        run["alert"] = {"level": "ERROR", "message": errors.sanitize(message, 4000), "url": None}
+             except KeyError:
+                 pass
+             if self.dashboard is not None:
+@@ -1065,7 +1091,27 @@
+                 record.update(epoch=record["epoch"] + 1, group=None, state="ready",
+                               group_retry=record.get("group_retry", 0) + 1, group_retries=record.get("group_retries", 0) + 1,
+                               last_group_error=errors.sanitize(error, 1000))
++                _record_alert(record, "Rollout failed; retrying",
++                    f"{record['last_group_error']} The unverified rollout was discarded. "
++                    f"Retrying the same task from checkpoint step {record['policy_version']} while time remains. "
++                    "No optimizer update was made from this rollout.")
+             return self.public_run(self.state.update(identifier, change, event="group_retry"))
++
++    def report_group_error(self, identifier: str, epoch: int, error: str) -> dict:
++        """Record the cause before cleanup; repeat reports for this group are idempotent."""
++        def change(record):
++            group = record.get("group")
++            if not group or group["epoch"] != epoch or record["state"] != "rolling":
++                raise errors.ArenaError(errors.STATE_CONFLICT, "Only the current group can report a rollout error", 409)
++            if group.get("error_reported"):
++                return
++            group["error_reported"] = True
++            record["last_group_error"] = errors.sanitize(error, 1000)
++            _record_alert(record, "Rollout failed",
++                f"{record['last_group_error']} The unverified rollout was discarded. "
++                "Arena is closing its sandboxes before retrying; training cannot resume until cleanup is confirmed. "
++                f"Last committed step: {record['policy_version']}.")
++        return self.public_run(self.state.update(identifier, change, event="rollout_error"))
+ 
+     def finish_group(self, identifier: str, epoch: int, results: list[dict]) -> dict:
+         with self.lock:
+@@ -1195,6 +1241,7 @@
+ 
+     # ------------------------------------------------------------------ reconciliation
+     def reconcile(self):
++        self._schedule_alert_delivery()
+         self._reconcile_admissions()
+         with self.lock:
+             self._expire_queued_submissions()
+@@ -1225,6 +1272,34 @@
+                 except Exception as error:
+                     self._cleanup_failure(record["run_id"], error)
+ 
++    def _schedule_alert_delivery(self) -> None:
++        # Network requests never occupy the deadline-enforcement or trainer callback threads.
++        if self.dashboard and (self.alert_delivery is None or self.alert_delivery.done()):
++            if self.alert_delivery is not None:
++                error = self.alert_delivery.exception()
++                if error is not None:
++                    LOG.warning("trackio_alert_worker_retry error_type=%s", type(error).__name__)
++            self.alert_delivery = self.alert_executor.submit(self._deliver_alerts)
++
++    def _deliver_alerts(self) -> None:
++        for item in self.state.pending_alerts():
++            record = self.state.run(item["run_id"])
++            delivered = False
++            try:
++                identity = record.get("trackio") or self._new_dashboard_identity(record["owner"], record["run_id"])
++                submission = self.state.submission(record["spec"]["submission_id"])["spec"]
++                spec = record["spec"]
++                config = {"participant": identity["project"], "submission_id": spec["submission_id"],
++                          "run_id": record["run_id"], "model": spec.get("model_id"),
++                          "model_revision": spec.get("model_revision"), "recipe": spec.get("recipe"),
++                          "num_updates": spec.get("num_updates"),
++                          "train_tasks": sum(task.get("split") == "train" for task in submission.get("tasks", []))}
++                post_alert(self.dashboard, identity, item["alert"], config)
++                delivered = True
++            except Exception as error:
++                LOG.warning("trackio_alert_pending run=%s error_type=%s", record["run_id"], type(error).__name__)
++            self.state.settle_alert(record["run_id"], item["alert"]["alert_id"], delivered)
++
+     def _start_queued_run(self) -> None:
+         """Start the run of the queued submission that has waited longest, when capacity allows."""
+         if self.submission_run is None or (self.run_start is not None and not self.run_start.done()):
+@@ -1286,8 +1361,12 @@
+             # Keep the original terminal decision; record repeated cleanup errors once.
+             if current.get("cleanup_error") == message and current["state"] == "cleanup_pending":
+                 return
+-            self.state.update(identifier, lambda record: record.update(state="cleanup_pending", cleanup_error=message),
+-                              event="cleanup_error")
++            def cleanup_error(record):
++                record.update(state="cleanup_pending", cleanup_error=message)
++                _record_alert(record, "Sandbox cleanup failed",
++                    f"{message} Arena will keep trying to release the resources. "
++                    f"Training has stopped at committed step {record['policy_version']}; cleanup is pending.", code)
++            self.state.update(identifier, cleanup_error, event="cleanup_error")
+             return
+         self.state.update(identifier, lambda record: _begin_cleanup(record, "failed", message, code, now),
+                           event="infrastructure_failure")
+@@ -1309,7 +1388,10 @@
+             # A failed group's Sandboxes may take a while to be confirmed ended before the trainer plays it again.
+             elif (record.get("group") and now >= record["group"]["deadline"] + GROUP_SETTLE_S
+                     and record["state"] == "rolling"):
+-                expiry = ("group_expired", errors.GROUP_DEADLINE_EXCEEDED, "Group deadline expired")
++                message = "Rollout recovery deadline expired before all sandboxes were confirmed stopped"
++                if record.get("last_group_error"):
++                    message += ". Original rollout error: " + record["last_group_error"]
++                expiry = ("group_expired", errors.GROUP_DEADLINE_EXCEEDED, message)
+             elif record["state"] == "updating" and now >= record.get("update_deadline", record["deadline"]):
+                 expiry = ("update_expired", errors.UPDATE_DEADLINE_EXCEEDED, "Optimizer/checkpoint deadline expired")
+             elif record["state"] == "resetting" and now >= record.get("reset_deadline", record["deadline"]):
+@@ -1351,9 +1433,15 @@
+             if cleanup.get("cleaned") is not True or pending != 0 or cleanup.get("failed") != 0 or slurm_open:
+                 stalled = now - started >= self.cleanup_stall_s
+                 if record.get("cleanup_pending_sessions") != pending or (stalled and not record.get("cleanup_stalled")):
+-                    self.state.update(identifier, lambda current: current.update(
+-                        cleanup_pending_sessions=pending, cleanup_stalled=current.get("cleanup_stalled") or stalled),
+-                        event="cleanup_stalled" if stalled and not record.get("cleanup_stalled") else None)
++                    newly_stalled = stalled and not record.get("cleanup_stalled")
++                    def cleanup_progress(current):
++                        current.update(cleanup_pending_sessions=pending,
++                                       cleanup_stalled=current.get("cleanup_stalled") or stalled)
++                        if newly_stalled:
++                            _record_alert(current, "Cleanup is taking longer than expected",
++                                "Training has stopped, but Arena is still waiting for resource termination. "
++                                f"Last committed step: {current['policy_version']}. Cleanup will continue automatically.")
++                    self.state.update(identifier, cleanup_progress, event="cleanup_stalled" if newly_stalled else None)
+                 return
+             stage = Path(self.config["slurm"]["shared_directory"]) / "runs" / identifier
+             if stage.is_dir():
+--- a/src/posttrain_infra/dashboard.py
++++ b/src/posttrain_infra/dashboard.py
+@@ -19,6 +19,8 @@
+ from urllib.parse import urlsplit
+ import urllib.request
+ import uuid
++
++from .errors import sanitize
+ 
+ ENVIRONMENT = "POSTTRAIN_TRACKIO"
+ POST_TIMEOUT_S = 15
+@@ -59,6 +61,19 @@
+     if not token or token.startswith("hf_") or any(not 33 <= ord(char) <= 126 for char in token):
+         raise ValueError("dashboard requires a dedicated ingestion token")
+     return token
++
++
++def post_alert(settings: dict, identity: dict, alert: dict, config: dict) -> None:
++    """Deliver one persisted event; its ID survives controller restarts and lost replies."""
++    dashboard = Dashboard(None)
++    dashboard.endpoint = identity["url"].rstrip("/") + "/ingest"
++    dashboard.token = read_ingestion_token(settings["token_file"])
++    dashboard._post([{
++        "project": identity["project"], "run": identity["name"], "run_id": identity["name"],
++        "alert_id": alert["alert_id"], "title": sanitize(alert["title"], 200),
++        "text": sanitize(alert["message"], 4000), "level": "error", "step": alert["step"],
++        "config": _safe_config(config),
++    }])
+ 
+ 
+ class Dashboard:
+@@ -129,13 +144,17 @@
+             self._warn("queue", "the dashboard is not keeping up, so some steps were not sent")
+ 
+     def _post(self, entries: list[dict]) -> None:
+-        body = json.dumps({"logs": entries}, allow_nan=False).encode()
++        payload = {}
++        for entry in entries:
++            payload.setdefault("alerts" if "alert_id" in entry else "logs", []).append(entry)
++        body = json.dumps(payload, allow_nan=False).encode()
+         request = urllib.request.Request(self.endpoint, data=body, method="POST",
+                                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"})
+         with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S) as reply:
+             answer = json.loads(reply.read(1 << 20) or b"{}")
+-        if type(answer) is dict and answer.get("error"):
+-            raise RuntimeError("dashboard rejected metrics")
++        if (type(answer) is not dict or answer.get("error") or type(answer.get("accepted")) is not int
++                or answer["accepted"] != len(entries)):
++            raise RuntimeError("dashboard did not acknowledge every event")
+ 
+     def _send(self) -> None:
+         while True:
+--- a/src/posttrain_infra/server.py
++++ b/src/posttrain_infra/server.py
+@@ -306,7 +306,7 @@
+         identifier, action = parts[2:4]
+         if not self.server.controller.state.authenticate_run(identifier, self.token()):
+             raise APIError(401, "Invalid run authentication")
+-        self.route = "internal/" + action if action in {"state", "group", "stop-worker", "select", "checkpoint", "reset", "ready", "fail", "artifacts", "retry"} else "internal/unknown"
++        self.route = "internal/" + action if action in {"state", "group", "stop-worker", "select", "checkpoint", "reset", "ready", "fail", "artifacts", "retry", "rollout-error"} else "internal/unknown"
+         if action == "artifacts" and len(parts) > 4:
+             return self.artifacts(identifier, "/".join(parts[4:]))
+         if len(parts) != 4:
+@@ -323,11 +323,12 @@
+         elif action == "stop-worker":
+             _fields(value, {"epoch", "name"})
+             result = controller.stop_worker(identifier, _integer(value["epoch"]), value["name"])
+-        elif action == "retry":
++        elif action in ("retry", "rollout-error"):
+             _fields(value, {"epoch", "error"})
+             if type(value["error"]) is not str or not 1 <= len(value["error"]) <= 1000:
+                 raise APIError(400, "The group's failure must be described in 1 to 1000 characters")
+-            result = controller.retry_group(identifier, _integer(value["epoch"]), value["error"])
++            operation = controller.retry_group if action == "retry" else controller.report_group_error
++            result = operation(identifier, _integer(value["epoch"]), value["error"])
+         elif action == "select":
+             _fields(value, {"epoch", "results"})
+             if type(value["results"]) is not list:
+--- a/src/posttrain_infra/state.py
++++ b/src/posttrain_infra/state.py
+@@ -70,6 +70,9 @@
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, body TEXT NOT NULL,
+                   created_at REAL NOT NULL, hidden INTEGER NOT NULL DEFAULT 0);
+                 CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, created_at);
++                CREATE TABLE IF NOT EXISTS run_alerts (
++                  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, payload TEXT NOT NULL,
++                  delivered INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0);
+             """)
+ 
+     @contextmanager
+@@ -275,6 +278,10 @@
+                 raise KeyError(identifier)
+             record = json.loads(row["record"])
+             change(record)
++            if record.get("alert"):
++                alert = record["alert"]
++                database.execute("INSERT OR IGNORE INTO run_alerts(id,run_id,payload) VALUES (?,?,?)",
++                                 (alert["alert_id"], identifier, encode(alert)))
+             database.execute("UPDATE runs SET record=? WHERE id=?", (encode(record), identifier))
+             if event:
+                 database.execute("INSERT INTO events(run_id,timestamp,kind,payload) VALUES(?,?,?,?)",
+@@ -297,6 +304,25 @@
+         with self.transaction() as database:
+             rows = database.execute("SELECT record FROM runs").fetchall()
+         return [record for row in rows if (record := json.loads(row[0]))["state"] not in ("completed", "cancelled", "failed")]
++
++    def pending_alerts(self, limit: int = 10) -> list[dict]:
++        """Durable delivery queue, including errors from trainers that have already exited."""
++        with self.transaction() as database:
++            rows = database.execute(
++                "SELECT run_id,payload FROM run_alerts WHERE delivered=0 AND retry_at<=? ORDER BY rowid LIMIT ?",
++                (time.time(), limit)).fetchall()
++        return [{"run_id": row[0], "alert": json.loads(row[1])} for row in rows]
++
++    def settle_alert(self, identifier: str, alert_id: str, delivered: bool) -> None:
++        with self.transaction() as database:
++            database.execute("UPDATE run_alerts SET delivered=?,retry_at=? WHERE id=? AND run_id=?",
++                             (int(delivered), time.time() + 60, alert_id, identifier))
++            if delivered:
++                row = database.execute("SELECT record FROM runs WHERE id=?", (identifier,)).fetchone()
++                record = json.loads(row[0])
++                if (record.get("alert") or {}).get("alert_id") == alert_id:
++                    record["alert"]["delivered"] = True
++                    database.execute("UPDATE runs SET record=? WHERE id=?", (encode(record), identifier))
+ 
+     def pending_submissions(self) -> list[dict]:
+         with self.transaction() as database:
+--- a/src/posttrain_infra/trainer.py
++++ b/src/posttrain_infra/trainer.py
+@@ -16,6 +16,7 @@
+ from .collector import Reply, collect_group
+ from .contracts import CANDIDATE_COUNT, SUPPORTED_MODEL, RunConfig, Submission, TaskContract
+ from .dashboard import Dashboard
++from .errors import sanitize
+ from .lifecycle import GROUP_SETTLE_S, SANDBOX_SHUTDOWN_S, AgentFailure, InfrastructureFailure, shutdown_grace
+ from .runtime import ActionError, OpenEnvSession, TransportError, _validator, decode_json, request_json, terminal_reward
+ from .validation import submission_digest
+@@ -120,6 +121,14 @@
+         self.endpoint, self.identifier, self.token = endpoint, identifier, token
+         self.outage_s = outage_s
+ 
++    def report_group_error(self, epoch: int, error: str) -> None:
++        """Best-effort error evidence before cleanup, with one request and no outage retries."""
++        try:
++            request_json(self.endpoint, f"/internal/runs/{self.identifier}/rollout-error",
++                         {"epoch": epoch, "error": sanitize(error, 1000)}, token=self.token, timeout=5)
++        except Exception:
++            pass  # Reporting must never prevent cleanup or change the existing recovery path.
++
+     def call(self, operation: str = "state", value: dict | None = None, *, timeout: float = 30) -> dict:
+         # Ride out a controller restart: a refused connection was never delivered,
+         # so retrying is safe even for non-idempotent operations. Timeouts and HTTP
+@@ -256,6 +265,7 @@
+         try:
+             return play()
+         except GroupFailed as failed:
++            client.report_group_error(failed.group["epoch"], str(failed))
+             asyncio.run(failed.settle())
+             client.call("retry", {"epoch": failed.group["epoch"], "error": str(failed)[:1000]})
+ 
+--- /dev/null
++++ b/tests/test_alerts.py
+@@ -0,0 +1,294 @@
++"""CPU-only regression coverage for persisted run alerts and delivery recovery."""
++import json
++import sqlite3
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import Mock, patch
++from urllib.parse import parse_qs, urlsplit
++
++from posttrain_infra import errors
++from posttrain_infra.controller import Controller
++from posttrain_infra.state import State
++
++
++class AlertTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        self.token = self.root / "ingest-token"
++        self.token.write_text("dedicated-ingestion-secret")
++        self.config = {
++            "slurm": {"partition": "gpu", "gpu_type": "h200", "shared_directory": str(self.root)},
++            "controller_url": "https://controller.example",
++            "trackio": {"url": "https://metrics.hf.space", "token_file": str(self.token)},
++        }
++        self.state = State(str(self.root / "state.sqlite"))
++        self.owner = "space:burtenshaw"
++        self.submission = {
++            "submission_id": "sql-investigation-v1", "images": [],
++            "tasks": [{"task_id": "train-one", "split": "train"},
++                      {"task_id": "held-out", "split": "test"}],
++        }
++        self.state.save_submission(self.submission, {}, "validated", self.owner, queue_run=True)
++        self.controller = self.make_controller()
++        self.record, self.run_token = self.state.create_run({
++            "submission_id": self.submission["submission_id"], "num_updates": 1000,
++            "model_id": "Qwen/Qwen3.5-9B", "model_revision": "a" * 40,
++            "recipe": "grpo", "private_extra": "never-forward-this",
++        }, "slurm", self.owner)
++        self.run_id = self.record["run_id"]
++        self.state.settle_run(self.submission["submission_id"], run_id=self.run_id)
++        self.state.update(self.run_id, lambda record: record.update(
++            state="ready", policy_version=39, checkpoint={"manifest": "durable-checkpoint"}))
++
++    def make_controller(self, **updates):
++        controller = Controller(self.state, {**self.config, **updates})
++        self.addCleanup(controller.validation_executor.shutdown)
++        self.addCleanup(controller.run_executor.shutdown)
++        self.addCleanup(controller.alert_executor.shutdown)
++        return controller
++
++    def summary(self):
++        return self.controller.list_submissions(self.owner)[0]["run"]
++
++    def fail(self):
++        return self.controller.fail(self.run_id, "Sandbox cleanup timed out", errors.INFRASTRUCTURE_FAILURE)
++
++    def retry(self, stopped=True):
++        record = self.state.run(self.run_id)
++        group = {"epoch": record["epoch"], "stopped": ["env-0"] if stopped else [],
++                 "remote_sessions": {"env-0": "session-0"}}
++        self.state.update(self.run_id, lambda current: current.update(state="rolling", group=group))
++        return self.controller.retry_group(self.run_id, group["epoch"], "Verifier transport failed")
++
++    def test_failure_explains_checkpoint_and_only_links_after_delivery(self):
++        run = self.fail()
++        self.assertEqual(run["state"], "cleanup")
++        self.assertEqual(run["policy_version"], 39)
++        summary = self.summary()
++        self.assertTrue(summary["checkpoint_available"])
++        self.assertIn("Checkpoint at step 39 is retained", summary["alert"]["message"])
++        self.assertIsNone(summary["alert"]["url"])
++        with patch("posttrain_infra.controller.post_alert") as send:
++            self.controller._deliver_alerts()
++        send.assert_called_once()
++        alert_url = urlsplit(self.summary()["alert"]["url"])
++        self.assertEqual(alert_url.path, "/reports")
++        self.assertEqual(parse_qs(alert_url.query), {"project": ["burtenshaw"], "runs": [self.run_id]})
++        self.assertEqual(self.state.pending_alerts(), [])
++        self.state.update(self.run_id, lambda current: current.update(state="completed", error=None))
++        self.assertEqual(self.summary()["alert"]["url"], alert_url.geturl())
++
++    def test_retry_discards_unverified_work_without_advancing_optimizer(self):
++        result = self.retry()
++        self.assertEqual(result["state"], "ready")
++        self.assertEqual(result["policy_version"], 39)
++        self.assertEqual(result["group_retries"], 1)
++        self.assertIsNone(self.state.run(self.run_id)["group"])
++        self.assertIn("unverified rollout was discarded", self.summary()["alert"]["message"])
++        self.assertIn("No optimizer update", self.summary()["alert"]["message"])
++        self.assertEqual(len(self.state.pending_alerts()), 1)
++
++    def test_retry_requires_confirmed_sandbox_cleanup(self):
++        with self.assertRaises(errors.ArenaError):
++            self.retry(stopped=False)
++        self.assertEqual(self.state.run(self.run_id)["state"], "rolling")
++        self.assertEqual(self.state.pending_alerts(), [])
++
++    def test_run_failure_and_outbox_commit_atomically(self):
++        before = self.state.run(self.run_id)
++        with self.state.transaction() as database:
++            database.execute("CREATE TRIGGER reject_alert BEFORE INSERT ON run_alerts "
++                             "BEGIN SELECT RAISE(FAIL, 'simulated storage failure'); END")
++        with self.assertRaises(sqlite3.IntegrityError):
++            self.fail()
++        self.assertEqual(self.state.run(self.run_id), before)
++        self.assertEqual(self.state.pending_alerts(), [])
++
++    def test_delivery_failure_retries_same_id_after_restart_without_blocking_run(self):
++        self.fail()
++        alert_id = self.state.pending_alerts()[0]["alert"]["alert_id"]
++        with patch("posttrain_infra.state.time.time", return_value=1000), \
++                patch("posttrain_infra.controller.post_alert", side_effect=TimeoutError("private-secret")), \
++                self.assertLogs("posttrain_infra.controller", level="WARNING") as logs:
++            self.controller._deliver_alerts()
++            self.assertEqual(self.state.pending_alerts(), [])
++        self.assertNotIn("private-secret", " ".join(logs.output))
++        self.assertEqual(self.state.run(self.run_id)["state"], "cleanup")
++        self.assertIsNone(self.summary()["alert"]["url"])
++        self.state = State(self.state.path)
++        self.controller = self.make_controller()
++        with patch("posttrain_infra.state.time.time", return_value=1061), \
++                patch("posttrain_infra.controller.post_alert") as send:
++            self.controller._deliver_alerts()
++        self.assertEqual(send.call_args.args[2]["alert_id"], alert_id)
++        self.assertIsNotNone(self.summary()["alert"]["url"])
++
++    def test_repeated_failure_keeps_first_alert_and_ack_does_not_link_a_newer_alert(self):
++        self.retry()
++        first = self.state.pending_alerts()[0]["alert"]
++        self.fail()
++        latest = self.state.run(self.run_id)["alert"]
++        self.controller.fail(self.run_id, "Repeated worker error")
++        self.assertEqual(self.state.run(self.run_id)["alert"]["alert_id"], latest["alert_id"])
++        self.assertEqual(len(self.state.pending_alerts()), 2)
++        self.state.settle_alert(self.run_id, first["alert_id"], True)
++        self.assertIsNone(self.summary()["alert"]["url"])
++        self.state.settle_alert(self.run_id, latest["alert_id"], True)
++        self.assertIsNotNone(self.summary()["alert"]["url"])
++        self.assertEqual(self.state.pending_alerts(), [])
++
++    def test_public_error_and_stored_alert_redact_credentials(self):
++        self.controller.fail(self.run_id,
++            "Sandbox failed hf_abcdefghijklmnop Bearer abcdefghijklmnop password=supersecret\n" + "x" * 5000)
++        serialized = json.dumps(self.state.pending_alerts()) + json.dumps(self.summary())
++        for secret in ("hf_abcdefghijklmnop", "abcdefghijklmnop", "supersecret"):
++            self.assertNotIn(secret, serialized)
++        self.assertIn("<redacted>", serialized)
++        self.assertLessEqual(len(self.summary()["alert"]["message"]), 4000)
++
++    def test_scheduler_never_starts_a_second_inflight_sender(self):
++        self.fail()
++        future = Mock()
++        future.done.return_value = False
++        with patch.object(self.controller.alert_executor, "submit", return_value=future) as submit:
++            self.controller._schedule_alert_delivery()
++            self.controller._schedule_alert_delivery()
++        submit.assert_called_once()
++        self.assertFalse(self.state.run(self.run_id)["alert"]["delivered"])
++
++    def test_alert_http_payload_uses_native_lowercase_level_and_header_credential(self):
++        self.fail()
++        alert = self.state.pending_alerts()[0]["alert"]
++        reply = Mock()
++        reply.__enter__ = Mock(return_value=reply)
++        reply.__exit__ = Mock(return_value=False)
++        reply.read.return_value = b'{"accepted":1}'
++        with patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply) as send:
++            self.controller._deliver_alerts()
++        request = send.call_args.args[0]
++        self.assertEqual(request.full_url, "https://metrics.hf.space/ingest")
++        self.assertEqual(request.get_header("Authorization"), "Bearer dedicated-ingestion-secret")
++        payload = json.loads(request.data)
++        self.assertEqual(set(payload), {"alerts"})
++        entry = payload["alerts"][0]
++        self.assertEqual(entry["alert_id"], alert["alert_id"])
++        self.assertEqual(entry["level"], "error")
++        self.assertEqual(entry["step"], 39)
++        self.assertEqual(entry["run"], self.run_id)
++        self.assertEqual(entry["run_id"], self.run_id)
++        self.assertEqual(entry["project"], "burtenshaw")
++        self.assertEqual(entry.get("config"), {
++            "participant": "burtenshaw", "submission_id": "sql-investigation-v1", "run_id": self.run_id,
++            "model": "Qwen/Qwen3.5-9B", "model_revision": "a" * 40,
++            "recipe": "grpo", "num_updates": 1000, "train_tasks": 1,
++        })
++        self.assertNotIn(b"dedicated-ingestion-secret", request.data)
++        self.assertNotIn(b"never-forward-this", request.data)
++
++    def test_alert_keeps_persisted_trackio_identity_when_configuration_changes(self):
++        self.state.update(self.run_id, lambda current: current.update(trackio={
++            "url": "https://original.hf.space", "project": "original-project", "name": "original-run",
++        }))
++        self.fail()
++        reply = Mock()
++        reply.__enter__ = Mock(return_value=reply)
++        reply.__exit__ = Mock(return_value=False)
++        reply.read.return_value = b'{"accepted":1}'
++        with patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply) as send:
++            self.controller._deliver_alerts()
++        request = send.call_args.args[0]
++        entry = json.loads(request.data)["alerts"][0]
++        self.assertEqual(request.full_url, "https://original.hf.space/ingest")
++        self.assertEqual((entry["project"], entry["run"]), ("original-project", "original-run"))
++        self.assertEqual(self.summary()["alert"]["url"],
++                         "https://original.hf.space/reports?project=original-project&runs=original-run")
++
++    def test_rejected_ingestion_keeps_alert_pending_without_leaking_response(self):
++        self.fail()
++        reply = Mock()
++        reply.__enter__ = Mock(return_value=reply)
++        reply.__exit__ = Mock(return_value=False)
++        reply.read.return_value = b'{"error":"remote-secret"}'
++        with patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply), \
++                self.assertLogs("posttrain_infra.controller", level="WARNING") as logs:
++            self.controller._deliver_alerts()
++        self.assertNotIn("remote-secret", " ".join(logs.output))
++        self.assertFalse(self.state.run(self.run_id)["alert"]["delivered"])
++        self.assertIsNone(self.summary()["alert"]["url"])
++
++    def test_rollout_error_is_visible_before_cleanup_and_repeat_report_is_idempotent(self):
++        self.state.update(self.run_id, lambda current: current.update(state="rolling", group={
++            "epoch": 0, "stopped": [], "remote_sessions": {"env-0": "session-0"},
++        }))
++        result = self.controller.report_group_error(self.run_id, 0, "Verifier timed out")
++        self.assertEqual(result["state"], "rolling")
++        self.assertEqual(result["policy_version"], 39)
++        original = self.state.pending_alerts()[0]["alert"]
++        self.assertIn("training cannot resume until cleanup is confirmed", original["message"])
++        self.assertIn("Verifier timed out", self.summary()["alert"]["message"])
++        self.controller.report_group_error(self.run_id, 0, "A repeated report")
++        self.assertEqual(self.state.pending_alerts(), [{"run_id": self.run_id, "alert": original}])
++        self.assertEqual(self.state.run(self.run_id)["group"]["stopped"], [])
++        with self.assertRaises(errors.ArenaError):
++            self.controller.retry_group(self.run_id, 0, "Verifier timed out")
++        with self.assertRaises(errors.ArenaError):
++            self.controller.report_group_error(self.run_id, 1, "Stale group")
++        self.assertEqual(self.state.pending_alerts()[0]["alert"]["alert_id"], original["alert_id"])
++
++    def test_cleanup_pending_records_new_failure_once_and_retains_original_cause(self):
++        self.fail()
++        first = self.state.run(self.run_id)
++        self.controller._cleanup_failure(self.run_id, TimeoutError("Management API unavailable"))
++        pending = self.state.run(self.run_id)
++        self.assertEqual(pending["state"], "cleanup_pending")
++        self.assertEqual(pending["error"], first["error"])
++        self.assertEqual(pending["terminal_state"], first["terminal_state"])
++        self.assertEqual(pending["checkpoint"], first["checkpoint"])
++        self.assertEqual(len(self.state.pending_alerts()), 2)
++        self.assertIn("keep trying to release the resources", pending["alert"]["message"])
++        self.assertIsNone(self.summary()["alert"]["url"])
++        self.controller._cleanup_failure(self.run_id, TimeoutError("Management API unavailable"))
++        self.assertEqual(self.state.run(self.run_id)["alert"]["alert_id"], pending["alert"]["alert_id"])
++        self.assertEqual(len(self.state.pending_alerts()), 2)
++        self.controller._cleanup_failure(self.run_id, TimeoutError("Different cleanup failure"))
++        self.assertEqual(len(self.state.pending_alerts()), 3)
++        self.assertEqual(self.state.run(self.run_id)["error"], first["error"])
++
++    def test_cleanup_stalled_creates_one_alert_while_reconciliation_keeps_trying(self):
++        self.fail()
++        self.state.update(self.run_id, lambda current: current.update(cleanup_started_at=0))
++        with patch.object(self.controller, "_hf_gateway", return_value=({"url": "https://gateway.example"}, "test", {})), \
++                patch("posttrain_infra.hf_sandbox.hf_management_cleanup", return_value={
++                    "cleaned": False, "pending": 2, "failed": 0,
++                }) as cleanup:
++            self.controller._reconcile_slurm_run(self.state.run(self.run_id))
++            stalled = self.state.run(self.run_id)
++            self.controller._reconcile_slurm_run(stalled)
++        self.assertEqual(cleanup.call_count, 2)
++        self.assertTrue(stalled["cleanup_stalled"])
++        self.assertEqual(stalled["cleanup_pending_sessions"], 2)
++        self.assertIn("Cleanup will continue automatically", stalled["alert"]["message"])
++        self.assertEqual(len(self.state.pending_alerts()), 2)
++        self.assertEqual(self.state.run(self.run_id)["alert"]["alert_id"], stalled["alert"]["alert_id"])
++
++    def test_missing_or_incorrect_acceptance_never_marks_alert_delivered(self):
++        self.fail()
++        for index, answer in enumerate(({}, {"accepted": 0}, {"accepted": True}, {"accepted": 2}, None)):
++            with self.subTest(answer=answer):
++                reply = Mock()
++                reply.__enter__ = Mock(return_value=reply)
++                reply.__exit__ = Mock(return_value=False)
++                reply.read.return_value = json.dumps(answer).encode()
++                with patch("posttrain_infra.state.time.time", return_value=1000 + index * 61), \
++                        patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply), \
++                        self.assertLogs("posttrain_infra.controller", level="WARNING"):
++                    self.controller._deliver_alerts()
++                self.assertFalse(self.state.run(self.run_id)["alert"]["delivered"])
++                self.assertIsNone(self.summary()["alert"]["url"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/tests/test_trackio.py
++++ b/tests/test_trackio.py
+@@ -58,6 +58,7 @@
+         self.assertNotEqual(row["log_id"], final["log_id"])
+         self.assertEqual(row["run"], row["run_id"])
+         failure.settle.assert_awaited_once()
++        client.report_group_error.assert_called_once_with(0, "RuntimeError: failed rollout")
+         client.call.assert_called_once_with("retry", {"epoch": 0, "error": "RuntimeError: failed rollout"})
+ 
+     def test_ingestion_credential_only_in_authorization_header(self):
+@@ -68,7 +69,7 @@
+         reply = Mock()
+         reply.__enter__ = Mock(return_value=reply)
+         reply.__exit__ = Mock(return_value=False)
+-        reply.read.return_value = b'{"ok":true}'
++        reply.read.return_value = b'{"accepted":1}'
+         with patch("posttrain_infra.dashboard.urllib.request.urlopen", return_value=reply) as post:
+             dashboard._post([entry])
+         request = post.call_args.args[0]
+@@ -154,6 +155,7 @@
+         controller = Controller(self.state, {**self.config, **settings})
+         self.addCleanup(controller.validation_executor.shutdown)
+         self.addCleanup(controller.run_executor.shutdown)
++        self.addCleanup(controller.alert_executor.shutdown)
+         return controller
+ 
+     def stage(self, controller, owner="space:burtenshaw"):
+--- /dev/null
++++ b/tests/test_trainer_alerts.py
+@@ -0,0 +1,68 @@
++"""Error reporting must not change the trainer's existing recovery decisions."""
++import unittest
++from unittest.mock import AsyncMock, Mock, patch
++
++from posttrain_infra.lifecycle import InfrastructureFailure
++from posttrain_infra.runtime import TransportError
++from posttrain_infra.trainer import GroupFailed, RunClient, play_until_verified
++
++
++class TrainerAlertTests(unittest.TestCase):
++    def client(self):
++        client = RunClient("https://controller.example", "run-id", "test-run-token", outage_s=120)
++        client.call = Mock(return_value={})
++        return client
++
++    def failure(self):
++        failure = GroupFailed({"epoch": 7}, [], InfrastructureFailure("Sandbox shutdown timed out"))
++        failure.settle = AsyncMock()
++        return failure
++
++    def test_reports_original_error_before_cleanup_then_uses_existing_retry(self):
++        client, failure = self.client(), self.failure()
++        order = []
++        failure.settle.side_effect = lambda: order.append("cleanup")
++        client.call.side_effect = lambda *args, **kwargs: order.append("retry")
++        with patch("posttrain_infra.trainer.request_json", side_effect=lambda *args, **kwargs: order.append("report")) as report:
++            self.assertEqual(play_until_verified(Mock(side_effect=[failure, {"ok": True}]), client), {"ok": True})
++        self.assertEqual(order, ["report", "cleanup", "retry"])
++        report.assert_called_once_with("https://controller.example", "/internal/runs/run-id/rollout-error",
++            {"epoch": 7, "error": "InfrastructureFailure: Sandbox shutdown timed out"},
++            token="test-run-token", timeout=5)
++        client.call.assert_called_once_with("retry", {"epoch": 7, "error": str(failure)})
++
++    def test_refused_error_report_is_one_bounded_request_without_outage_retries(self):
++        client, failure = self.client(), self.failure()
++        error = TransportError("Connection refused")
++        error.__cause__ = ConnectionRefusedError()
++        with patch("posttrain_infra.trainer.request_json", side_effect=error) as report, \
++                patch("posttrain_infra.trainer.time.sleep") as sleep:
++            self.assertEqual(play_until_verified(Mock(side_effect=[failure, {"ok": True}]), client), {"ok": True})
++        report.assert_called_once()
++        self.assertEqual(report.call_args.kwargs["timeout"], 5)
++        sleep.assert_not_called()
++        failure.settle.assert_awaited_once()
++        client.call.assert_called_once()
++
++    def test_report_precedes_cleanup_failure_without_adding_a_retry(self):
++        client, failure = self.client(), self.failure()
++        failure.settle.side_effect = InfrastructureFailure("Cleanup acknowledgement expired")
++        with patch("posttrain_infra.trainer.request_json", return_value={}) as report:
++            with self.assertRaisesRegex(InfrastructureFailure, "Cleanup acknowledgement expired"):
++                play_until_verified(Mock(side_effect=failure), client)
++        self.assertIn("Sandbox shutdown timed out", report.call_args.args[2]["error"])
++        client.call.assert_not_called()
++
++    def test_reporting_redacts_and_bounds_error_payload(self):
++        client = self.client()
++        with patch("posttrain_infra.trainer.request_json", return_value={}) as report:
++            client.report_group_error(7, "hf_abcdefghijklmnop Bearer abcdefghijklmnop\n" + "x" * 2000)
++        message = report.call_args.args[2]["error"]
++        self.assertNotIn("abcdefghijklmnop", message)
++        self.assertIn("<redacted>", message)
++        self.assertLessEqual(len(message), 1000)
++        self.assertNotIn("\n", message)
++
++
++if __name__ == "__main__":
++    unittest.main()
